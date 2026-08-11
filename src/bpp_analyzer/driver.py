@@ -17,11 +17,11 @@ import uuid
 
 from bpp_analyzer.bundle_source import HourExpired, RawHourIndex, RetryableSourceError
 from bpp_analyzer.fact_store import FactStore, parse_source_day
-from bpp_analyzer.locking import DirectoryLock
+from bpp_analyzer.locking import DirectoryLock, LockOwnershipLost
 from bpp_analyzer.projection import project_hour
+from bpp_analyzer.release import EPOCH_DAY, ReleaseBuilder, local_newest_release_id
 
 
-EPOCH_DAY = date(2026, 8, 7)
 DEFAULT_HEAL_DAYS = 8
 DEFAULT_SETTLE_LAG = timedelta(seconds=60)
 
@@ -66,6 +66,8 @@ class PipelineDriver:
         heartbeat_interval: float = 30,
         stale_after: float = 300,
         max_run_seconds: float = 7200,
+        duckdb_memory_limit: str = "8GB",
+        duckdb_threads: int = 8,
     ) -> None:
         if settle_lag <= timedelta():
             raise ValueError("Settle lag must be positive")
@@ -76,6 +78,8 @@ class PipelineDriver:
         self.heartbeat_interval = heartbeat_interval
         self.stale_after = stale_after
         self.max_run_seconds = max_run_seconds
+        self.duckdb_memory_limit = duckdb_memory_limit
+        self.duckdb_threads = duckdb_threads
 
     def run(
         self,
@@ -87,9 +91,7 @@ class PipelineDriver:
     ) -> RunSummary:
         if not isinstance(heal_days, int) or isinstance(heal_days, bool) or heal_days < 1:
             raise ValueError("heal_days must be a positive integer")
-        if anchor_day is not None:
-            parse_source_day(anchor_day)
-        del publish  # Release build/publish arrives in later phases.
+        parsed_anchor = parse_source_day(anchor_day) if anchor_day is not None else None
         now = _aware_utc(self.clock())
         run_id = uuid.uuid4().hex
         if dry_run:
@@ -129,6 +131,7 @@ class PipelineDriver:
             if lock.stale_run_id is not None:
                 run_log.write(f"stale lock taken over: {lock.stale_run_id}")
             started_monotonic = time.monotonic()
+            summary: RunSummary | None = None
             try:
                 summary = self._heal(
                     store,
@@ -139,27 +142,80 @@ class PipelineDriver:
                     started_monotonic=started_monotonic,
                     log=run_log.write,
                 )
+                build_started = time.monotonic()
+                seals = store.seals()
+                selected_anchor = parsed_anchor or (
+                    parse_source_day(seals[-1].source_day) if seals else None
+                )
+                if selected_anchor is not None:
+                    local = ReleaseBuilder(
+                        self.data_root,
+                        store=store,
+                        memory_limit=self.duckdb_memory_limit,
+                        threads=self.duckdb_threads,
+                        ownership_check=lock.assert_owned,
+                    ).build(selected_anchor, seals)
+                    if local.reused:
+                        run_log.write(f"release reused: {local.release_id}")
+                    else:
+                        run_log.write(f"release built: {local.release_id}")
+                        summary = replace(
+                            summary,
+                            outcome="ok" if summary.outcome == "noop" else summary.outcome,
+                            release_built=local.release_id,
+                        )
+                    if publish:
+                        run_log.write("release publish deferred until Phase 3")
+                summary = replace(
+                    summary,
+                    finished_at=_aware_utc(self.clock()).isoformat().replace("+00:00", "Z"),
+                    timings={
+                        **summary.timings,
+                        "total_seconds": round(
+                            max(time.monotonic() - started_monotonic, 0.0), 6
+                        ),
+                        "build_seconds": round(
+                            max(time.monotonic() - build_started, 0.0), 6
+                        ),
+                    },
+                    peak_rss_bytes=peak_rss_bytes(),
+                )
             except BaseException as error:
                 if isinstance(error, (KeyboardInterrupt, SystemExit)):
                     raise
                 finished = _aware_utc(self.clock())
-                summary = _summary(
-                    run_id,
-                    now,
-                    finished,
-                    outcome="error",
-                    exit_code=1,
-                    hours_ingested=0,
-                    days_sealed=0,
-                    days_abandoned=0,
-                    failures=(
-                        {
-                            "scope": "run",
-                            "reason": getattr(error, "reason", type(error).__name__),
+                failure = {
+                    "scope": "run" if summary is None else "release",
+                    "reason": str(getattr(error, "reason", type(error).__name__)),
+                }
+                if summary is None:
+                    summary = _summary(
+                        run_id,
+                        now,
+                        finished,
+                        outcome="error",
+                        exit_code=1,
+                        hours_ingested=0,
+                        days_sealed=0,
+                        days_abandoned=0,
+                        failures=(failure,),
+                        elapsed=time.monotonic() - started_monotonic,
+                    )
+                else:
+                    summary = replace(
+                        summary,
+                        finished_at=finished.isoformat().replace("+00:00", "Z"),
+                        timings={
+                            **summary.timings,
+                            "total_seconds": round(
+                                max(time.monotonic() - started_monotonic, 0.0), 6
+                            ),
                         },
-                    ),
-                    elapsed=time.monotonic() - started_monotonic,
-                )
+                        outcome="error",
+                        exit_code=1,
+                        failures=summary.failures + (failure,),
+                        peak_rss_bytes=peak_rss_bytes(),
+                    )
                 run_log.write(
                     f"run failed: {getattr(error, 'reason', type(error).__name__)}"
                 )
@@ -385,7 +441,7 @@ def build_status(
         },
         "release": {
             "publish_hold": (root / "publish-hold.json").is_file(),
-            "local_newest_release_id": None,
+            "local_newest_release_id": local_newest_release_id(root),
             "published_release_id": None,
             "published_window_end": None,
             "published_manifest_age_seconds": None,
@@ -429,7 +485,7 @@ def _error_status(root: Path, summary: RunSummary) -> dict[str, Any]:
         },
         "release": {
             "publish_hold": (root / "publish-hold.json").is_file(),
-            "local_newest_release_id": None,
+            "local_newest_release_id": local_newest_release_id(root),
             "published_release_id": None,
             "published_window_end": None,
             "published_manifest_age_seconds": None,

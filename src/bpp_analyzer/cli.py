@@ -11,6 +11,11 @@ from bpp_analyzer.config import ConfigurationError, load_config
 from bpp_analyzer.driver import PipelineDriver, read_status
 from bpp_analyzer.fact_store import FactStore, FactStoreError, parse_source_day
 from bpp_analyzer.locking import LockHeld, LockOwnershipLost
+from bpp_analyzer.release import (
+    ReleaseBuildError,
+    ReleaseBuilder,
+    validate_local_releases,
+)
 
 
 @click.group()
@@ -60,6 +65,8 @@ def run_command(
                 config.data_root,
                 source=source,
                 max_run_seconds=config.max_run_seconds,
+                duckdb_memory_limit=config.duckdb_memory_limit,
+                duckdb_threads=config.duckdb_threads,
             ).run(
                 heal_days=heal_days,
                 anchor_day=anchor_day,
@@ -77,6 +84,8 @@ def run_command(
     except (ConfigurationError, ValueError) as error:
         raise click.UsageError(str(error)) from None
     except LockOwnershipLost as error:
+        raise click.ClickException(str(error)) from None
+    except ReleaseBuildError as error:
         raise click.ClickException(str(error)) from None
 
 
@@ -111,21 +120,25 @@ def verify_command(day: str | None, deep: bool) -> None:
             parse_source_day(day)
         config = load_config(require_source=False)
         report = FactStore(config.data_root).verify(day, deep=deep)
+        releases_verified = (
+            validate_local_releases(config.data_root) if deep else 0
+        )
     except (ConfigurationError, ValueError) as error:
         raise click.UsageError(str(error)) from None
-    except FactStoreError as error:
+    except (FactStoreError, ReleaseBuildError) as error:
         raise click.ClickException(str(error)) from None
+    suffix = f" and {releases_verified} releases" if deep else ""
     click.echo(
-        f"verified {report.hours_verified} hours and {report.files_verified} Parquet files"
+        f"verified {report.hours_verified} hours and {report.files_verified} Parquet files{suffix}"
     )
 
 
 @main.command("publish")
 @click.argument("release_id")
 def publish_command(release_id: str) -> None:
-    """Publish an already-built release (available after the publish phase)."""
+    """Publish an already-built release (available in Phase 3)."""
     del release_id
-    raise click.ClickException("Release publishing is not implemented in Phase 1")
+    raise click.ClickException("Release publishing is not implemented until Phase 3")
 
 
 @main.command("rollback")
@@ -134,7 +147,7 @@ def publish_command(release_id: str) -> None:
 def rollback_command(release_id: str, reason: str) -> None:
     """Roll back the public pointer (available after the publish phase)."""
     del release_id, reason
-    raise click.ClickException("Release rollback is not implemented in Phase 1")
+    raise click.ClickException("Release rollback is not implemented until Phase 3")
 
 
 @main.command("resume")
@@ -142,7 +155,7 @@ def rollback_command(release_id: str, reason: str) -> None:
 def resume_command(reason: str) -> None:
     """Clear a publish hold (available after the publish phase)."""
     del reason
-    raise click.ClickException("Release resume is not implemented in Phase 1")
+    raise click.ClickException("Release resume is not implemented until Phase 3")
 
 
 @main.group("show")
@@ -153,9 +166,19 @@ def show_command() -> None:
 @show_command.command("release")
 @click.argument("release_id")
 def show_release_command(release_id: str) -> None:
-    """Show a local release (available after the build phase)."""
-    del release_id
-    raise click.ClickException("Release inspection is not implemented in Phase 1")
+    """Show a local release manifest."""
+    try:
+        config = load_config(require_source=False)
+        manifest = ReleaseBuilder(
+            config.data_root,
+            memory_limit=config.duckdb_memory_limit,
+            threads=config.duckdb_threads,
+        ).show(release_id)
+    except ConfigurationError as error:
+        raise click.UsageError(str(error)) from None
+    except ReleaseBuildError as error:
+        raise click.ClickException(str(error)) from None
+    click.echo(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
 
 
 if __name__ == "__main__":

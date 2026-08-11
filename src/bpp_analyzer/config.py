@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 
 from dotenv import dotenv_values
 
@@ -21,6 +22,8 @@ class Config:
     download_concurrency: int = 4
     download_lookahead: int = 8
     max_run_seconds: int = 7200
+    duckdb_memory_limit: str = "8GB"
+    duckdb_threads: int = 8
 
 
 def repository_root() -> Path:
@@ -59,6 +62,10 @@ def load_config(*, require_source: bool = True, root: Path | None = None) -> Con
         max_run_seconds=_positive_int(
             values.get("BPP_MAX_RUN_SECONDS"), 7200, "BPP_MAX_RUN_SECONDS"
         ),
+        duckdb_memory_limit=_memory_limit(values.get("BPP_DUCKDB_MEMORY_LIMIT")),
+        duckdb_threads=_positive_int(
+            values.get("BPP_DUCKDB_THREADS"), 8, "BPP_DUCKDB_THREADS"
+        ),
     )
 
 
@@ -75,4 +82,19 @@ def _positive_int(value: object, default: int, name: str) -> int:
         raise ConfigurationError(f"{name} must be a positive integer") from error
     if parsed < 1:
         raise ConfigurationError(f"{name} must be a positive integer")
+    return parsed
+
+
+def _memory_limit(value: object) -> str:
+    if value is None or value == "":
+        return "8GB"
+    parsed = str(value).strip().upper()
+    if re.fullmatch(r"\d+(?:\.\d+)?(?:KB|MB|GB|TB)", parsed) is None:
+        raise ConfigurationError(
+            "BPP_DUCKDB_MEMORY_LIMIT must be a positive size such as 8GB"
+        )
+    if float(parsed[:-2]) <= 0:
+        raise ConfigurationError(
+            "BPP_DUCKDB_MEMORY_LIMIT must be a positive size such as 8GB"
+        )
     return parsed
