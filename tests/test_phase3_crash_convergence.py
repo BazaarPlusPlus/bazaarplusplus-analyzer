@@ -24,7 +24,10 @@ def _bytes(root: Path) -> dict[str, bytes]:
     }
 
 
-@pytest.mark.parametrize("fault_seam", ["before_hour_promote", "before_seal_promote"])
+@pytest.mark.parametrize(
+    "fault_seam",
+    ["before_precommit_verify", "before_hour_promote", "before_seal_promote"],
+)
 def test_acceptance_3_commit_and_seal_crashes_converge_to_uninterrupted_facts(
     tmp_path: Path, fault_seam: str
 ) -> None:
@@ -50,8 +53,9 @@ def test_acceptance_3_commit_and_seal_crashes_converge_to_uninterrupted_facts(
     assert _bytes(crashed_root / "facts") == _bytes(expected_root / "facts")
 
 
+@pytest.mark.parametrize("fault_seam", ["after_payloads_written", "after_manifest_written"])
 def test_acceptance_3_release_stage_crash_converges_to_uninterrupted_release(
-    tmp_path: Path,
+    tmp_path: Path, fault_seam: str
 ) -> None:
     expected_root = tmp_path / "expected"
     expected_facts = sealed_store(expected_root, 1)
@@ -62,10 +66,10 @@ def test_acceptance_3_release_stage_crash_converges_to_uninterrupted_release(
     crashed_facts = sealed_store(crashed_root, 1)
 
     def crash(seam: str, _path: Path) -> None:
-        if seam == "after_manifest_written":
-            raise RuntimeError("crash mid-stage")
+        if seam == fault_seam:
+            raise RuntimeError(f"crash at {fault_seam}")
 
-    with pytest.raises(RuntimeError, match="mid-stage"):
+    with pytest.raises(RuntimeError, match=fault_seam):
         ReleaseBuilder(
             crashed_root,
             store=crashed_facts,
@@ -79,8 +83,9 @@ def test_acceptance_3_release_stage_crash_converges_to_uninterrupted_release(
     assert _bytes(converged.path) == _bytes(expected.path)
 
 
-def test_acceptance_3_pre_pointer_publish_crash_converges_to_uninterrupted_remote(
-    tmp_path: Path,
+@pytest.mark.parametrize("fault_seam", ["after_artifact_confirmed", "before_pointer_put"])
+def test_acceptance_3_publish_crash_converges_to_uninterrupted_remote(
+    tmp_path: Path, fault_seam: str
 ) -> None:
     root = tmp_path / "data"
     facts = sealed_store(root, 1)
@@ -90,10 +95,10 @@ def test_acceptance_3_pre_pointer_publish_crash_converges_to_uninterrupted_remot
     crashed_objects = LocalObjectStore(tmp_path / "crashed-objects", clock=lambda: NOW)
 
     def crash(seam: str, _key: str) -> None:
-        if seam == "before_pointer_put":
-            raise RuntimeError("crash before pointer")
+        if seam == fault_seam:
+            raise RuntimeError(f"crash at {fault_seam}")
 
-    with pytest.raises(RuntimeError, match="before pointer"):
+    with pytest.raises(RuntimeError, match=fault_seam):
         ReleasePublisher(
             root,
             crashed_objects,
