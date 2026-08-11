@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "hero_window",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "generated_at", "window", "params", "submitters", "rows"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "hero_window"},
+    "generated_at": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"},
+    "window": {"$ref": "#/$defs/window"},
+    "params": {"type": "object", "additionalProperties": false},
+    "submitters": {"$ref": "#/$defs/submitters"},
+    "rows": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["hero", "segment", "runs", "win_rate", "performance_rating", "avg_opponent_rating", "rating", "rating_delta", "ten_win", "rank_runs", "opponent_ranks", "ghost", "matchups"],
+        "properties": {
+          "hero": {"type": "string", "minLength": 1},
+          "segment": {"enum": ["all", "legend", "non_legend"]},
+          "runs": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["completed", "results"],
+            "properties": {
+              "completed": {"$ref": "#/$defs/count"},
+              "results": {"$ref": "#/$defs/results"}
+            }
+          },
+          "win_rate": {"$ref": "#/$defs/rate"},
+          "performance_rating": {"type": ["number", "null"]},
+          "avg_opponent_rating": {"type": ["number", "null"]},
+          "rating": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["runs", "mean", "stddev", "p10", "p50", "p90", "min", "max"],
+            "properties": {
+              "runs": {"$ref": "#/$defs/count"},
+              "mean": {"type": ["number", "null"]},
+              "stddev": {"type": ["number", "null"]},
+              "p10": {"type": ["number", "null"]},
+              "p50": {"type": ["number", "null"]},
+              "p90": {"type": ["number", "null"]},
+              "min": {"type": ["integer", "null"]},
+              "max": {"type": ["integer", "null"]}
+            }
+          },
+          "rating_delta": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["runs", "net"],
+            "properties": {
+              "runs": {"$ref": "#/$defs/count"},
+              "net": {"type": "integer"}
+            }
+          },
+          "ten_win": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["runs", "avg_final_days"],
+            "properties": {
+              "runs": {"$ref": "#/$defs/count"},
+              "avg_final_days": {"type": ["number", "null"]}
+            }
+          },
+          "rank_runs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["rank", "runs"],
+              "properties": {
+                "rank": {"type": "string", "minLength": 1},
+                "runs": {"$ref": "#/$defs/count"}
+              }
+            }
+          },
+          "opponent_ranks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["rank", "decided", "share", "win_rate"],
+              "properties": {
+                "rank": {"type": "string", "minLength": 1},
+                "decided": {"$ref": "#/$defs/count"},
+                "share": {"$ref": "#/$defs/rate"},
+                "win_rate": {"$ref": "#/$defs/rate"}
+              }
+            }
+          },
+          "ghost": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["battles", "win_rate"],
+            "properties": {
+              "battles": {"$ref": "#/$defs/count"},
+              "win_rate": {"$ref": "#/$defs/rate"}
+            }
+          },
+          "matchups": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["opponent_hero", "decided", "wins", "losses", "win_rate"],
+              "properties": {
+                "opponent_hero": {"type": "string", "minLength": 1},
+                "decided": {"$ref": "#/$defs/count"},
+                "wins": {"$ref": "#/$defs/count"},
+                "losses": {"$ref": "#/$defs/count"},
+                "win_rate": {"$ref": "#/$defs/rate"}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "count": {"type": "integer", "minimum": 0},
+    "rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+    "window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end", "days"],
+      "properties": {
+        "start": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+        "end": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+        "days": {"type": "integer", "minimum": 1, "maximum": 7}
+      }
+    },
+    "results": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["flawless", "ten_win", "wins_7_9", "wins_4_6", "wins_0_3"],
+      "properties": {
+        "flawless": {"$ref": "#/$defs/count"},
+        "ten_win": {"$ref": "#/$defs/count"},
+        "wins_7_9": {"$ref": "#/$defs/count"},
+        "wins_4_6": {"$ref": "#/$defs/count"},
+        "wins_0_3": {"$ref": "#/$defs/count"}
+      }
+    },
+    "submitters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["all", "by_hero"],
+      "properties": {
+        "all": {"$ref": "#/$defs/count"},
+        "by_hero": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["hero", "submitters"],
+            "properties": {
+              "hero": {"type": "string", "minLength": 1},
+              "submitters": {"$ref": "#/$defs/count"}
+            }
+          }
+        }
+      }
+    }
+  }
+}

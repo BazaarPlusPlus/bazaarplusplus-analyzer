@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "builds",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "generated_at", "window", "params", "cards", "enchantments", "schemas", "selection_reasons", "heroes"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "builds"},
+    "generated_at": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"},
+    "window": {"$ref": "#/$defs/window"},
+    "params": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pool", "segment_definition", "core_build_limit_per_hero", "min_ten_win_runs", "wilson_z", "evidence_weight", "legend_weight", "speed_weight", "stability_weight", "coverage_policy"],
+      "properties": {
+        "pool": {"const": "window_completed_runs"},
+        "segment_definition": {"const": "rank_legendary"},
+        "core_build_limit_per_hero": {"const": 500},
+        "min_ten_win_runs": {"const": 1},
+        "wilson_z": {"const": 1.96},
+        "evidence_weight": {"const": 1000},
+        "legend_weight": {"const": 250},
+        "speed_weight": {"const": 100},
+        "stability_weight": {"const": 50},
+        "coverage_policy": {"const": "append_best_build_per_uncovered_card"}
+      }
+    },
+    "cards": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}
+    },
+    "enchantments": {"type": "array", "items": {"type": ["string", "null"]}},
+    "schemas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["build", "layout", "stats", "selection"],
+      "properties": {
+        "build": {"const": ["card_refs", "layout", "stats", "selection"]},
+        "layout": {"const": ["card_ref", "slot", "tier", "enchant_ref", "size"]},
+        "stats": {"const": ["completed_run_count", "ten_win_run_count", "ten_win_rate_bps", "avg_ten_win_final_day_tenth", "p75_ten_win_final_day", "avg_ten_win_final_losses_tenth", "legend_completed_run_count", "legend_ten_win_run_count", "legend_ten_win_rate_bps", "legend_avg_ten_win_final_day_tenth", "score"]},
+        "selection": {"const": ["reason", "covered_card_ref"]}
+      }
+    },
+    "selection_reasons": {"const": ["core", "coverage"]},
+    "heroes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["hero", "candidate_build_count", "candidate_card_count", "included_build_count", "covered_card_count", "coverage", "builds", "card_index"],
+        "properties": {
+          "hero": {"type": "string", "minLength": 1},
+          "candidate_build_count": {"type": "integer", "minimum": 0},
+          "candidate_card_count": {"type": "integer", "minimum": 0},
+          "included_build_count": {"type": "integer", "minimum": 0},
+          "covered_card_count": {"type": "integer", "minimum": 0},
+          "coverage": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["uncovered_card_refs"],
+            "properties": {
+              "uncovered_card_refs": {"type": "array", "items": {"type": "integer", "minimum": 0}}
+            }
+          },
+          "builds": {"type": "array", "items": {"type": "array", "minItems": 4, "maxItems": 4}},
+          "card_index": {"type": "array"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end", "days"],
+      "properties": {
+        "start": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+        "end": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+        "days": {"type": "integer", "minimum": 1, "maximum": 7}
+      }
+    }
+  }
+}
