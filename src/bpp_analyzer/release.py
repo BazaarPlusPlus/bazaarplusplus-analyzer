@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 import hashlib
 import json
 import math
@@ -14,15 +14,17 @@ import re
 import shutil
 import tempfile
 from typing import Any
+import uuid
 
 import duckdb
 from jsonschema import Draft202012Validator
 
 from bpp_analyzer.fact_store import DaySeal, FactStore, TABLES, canonical_json, parse_source_day
+from bpp_analyzer.object_store import ObjectStat, ObjectStore, StoredObject
 
 
 EPOCH_DAY = date(2026, 8, 7)
-BUILDER_CODE_VERSION = "0.2.0"
+BUILDER_CODE_VERSION = "0.3.0"
 POLICY_VERSION = "v5-contract-1"
 MAX_FETCH_ROWS = 10_000
 MIN_RATED_BATTLES = 50
@@ -34,6 +36,11 @@ EVIDENCE_WEIGHT = 1000
 LEGEND_WEIGHT = 250
 SPEED_WEIGHT = 100
 STABILITY_WEIGHT = 50
+
+OBJECT_PREFIX = "analyzer-v5"
+POINTER_KEY = f"{OBJECT_PREFIX}/manifest.json"
+IMMUTABLE_CACHE_CONTROL = "public,max-age=31536000,immutable"
+POINTER_CACHE_CONTROL = "public,max-age=60,must-revalidate"
 
 CANONICAL_HEROES = (
     "Dooley",
@@ -93,12 +100,63 @@ class ManifestMismatch(ReleaseBuildError):
     """A manifest inventory differs from the staged bytes or file set."""
 
 
+class PublishError(RuntimeError):
+    """A release cannot be safely exposed through the public pointer."""
+
+
+class InvalidPointer(PublishError):
+    """The current public pointer violates its frozen self-identity."""
+
+
+class AntiRegressionError(PublishError):
+    """A normal publish attempted to move the window backward."""
+
+
+class ImmutableObjectConflict(PublishError):
+    """An immutable release key already contains different bytes or metadata."""
+
+
+class PublishConfirmationError(PublishError):
+    """An object did not confirm with the exact bytes and Cache-Control."""
+
+
+class PublishHold(PublishError):
+    """A local publish hold blocks normal publication."""
+
+
 @dataclass(frozen=True, slots=True)
 class LocalRelease:
     release_id: str
     path: Path
     manifest: Mapping[str, Any]
     reused: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedPointer:
+    release_id: str
+    window_end: str
+    manifest: Mapping[str, Any]
+    stat: ObjectStat
+
+
+@dataclass(frozen=True, slots=True)
+class PublishResult:
+    release_id: str
+    uploaded: int
+    skipped: int
+    pointer: PublishedPointer
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorResult:
+    action: str
+    release_id: str
+    receipt_path: Path
+    pointer: PublishedPointer | None
+
+
+_CURRENT_UNSET = object()
 
 
 def window_seals(
@@ -319,9 +377,12 @@ class ReleaseBuilder:
                 shutil.rmtree(stage, ignore_errors=True)
 
     def show(self, release_id: str) -> Mapping[str, Any]:
+        return self.local(release_id).manifest
+
+    def local(self, release_id: str) -> LocalRelease:
         if RELEASE_ID_PATTERN.fullmatch(release_id) is None:
             raise ReleaseIdentityError("Release ID is invalid")
-        return self._reuse(self.root / "releases" / release_id, release_id).manifest
+        return self._reuse(self.root / "releases" / release_id, release_id)
 
     def _reuse(self, path: Path, release_id: str) -> LocalRelease:
         try:
@@ -331,6 +392,195 @@ class ReleaseBuilder:
         if manifest.get("release_id") != release_id:
             raise ReleaseIdentityError(f"Existing release identity differs: {release_id}")
         return LocalRelease(release_id, path, manifest, reused=True)
+
+
+class ReleasePublisher:
+    """Enforce immutable release objects and one mutable public pointer."""
+
+    def __init__(
+        self,
+        data_root: str | Path,
+        object_store: ObjectStore,
+        *,
+        contracts_dir: str | Path | None = None,
+        clock: Callable[[], datetime] | None = None,
+        ownership_check: Callable[[], None] = lambda: None,
+        fault_injector: Callable[[str, str], None] | None = None,
+    ) -> None:
+        self.root = Path(data_root)
+        self.object_store = object_store
+        self.contracts_dir = Path(contracts_dir) if contracts_dir else _default_contracts_dir()
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._ownership_check = ownership_check
+        self._fault = fault_injector or (lambda _seam, _key: None)
+
+    def current_pointer(self) -> PublishedPointer | None:
+        observed = self.object_store.get(POINTER_KEY)
+        if observed is None:
+            return None
+        return _parse_pointer(observed, self.contracts_dir)
+
+    def publish(
+        self,
+        release: LocalRelease,
+        *,
+        current: PublishedPointer | None | object = _CURRENT_UNSET,
+    ) -> PublishResult:
+        if (self.root / "publish-hold.json").is_file():
+            raise PublishHold("publish-hold.json blocks publication")
+        pointer = self.current_pointer() if current is _CURRENT_UNSET else current
+        if pointer is not None and not isinstance(pointer, PublishedPointer):
+            raise TypeError("Current pointer must be PublishedPointer or None")
+        if pointer is not None and pointer.release_id == release.release_id:
+            return PublishResult(release.release_id, 0, 0, pointer)
+        target_end = parse_source_day(release.manifest["window"]["end"])
+        if pointer is not None and target_end < parse_source_day(pointer.window_end):
+            raise AntiRegressionError(
+                f"Release window {target_end.isoformat()} precedes published "
+                f"window {pointer.window_end}"
+            )
+
+        validate_release(release.path, self.contracts_dir)
+        uploaded, skipped = self._ensure_artifacts(release)
+        published = self._put_pointer(release)
+        return PublishResult(release.release_id, uploaded, skipped, published)
+
+    def rollback(self, release: LocalRelease, reason: str) -> OperatorResult:
+        reason = _required_reason(reason)
+        current = self.current_pointer()
+        if current is None:
+            raise PublishError("Cannot rollback without a published pointer")
+        if current.release_id == release.release_id:
+            raise PublishError("Rollback target is already published")
+        target_end = parse_source_day(release.manifest["window"]["end"])
+        if target_end > parse_source_day(current.window_end):
+            raise PublishError("Rollback target cannot be newer than the current pointer")
+        validate_release(release.path, self.contracts_dir)
+        self._ensure_artifacts(release)
+        created_at = self._now_string()
+        hold = {
+            "schema_version": 1,
+            "target_release_id": release.release_id,
+            "previous_release_id": current.release_id,
+            "reason": reason,
+            "created_at": created_at,
+        }
+        self._ownership_check()
+        _atomic_replace_file(self.root / "publish-hold.json", canonical_json(hold))
+        pointer = self._put_pointer(release)
+        receipt = {
+            "schema_version": 1,
+            "action": "rollback",
+            "from_release_id": current.release_id,
+            "to_release_id": release.release_id,
+            "reason": reason,
+            "created_at": created_at,
+        }
+        path = self._write_receipt(receipt, created_at)
+        return OperatorResult("rollback", release.release_id, path, pointer)
+
+    def resume(self, reason: str) -> OperatorResult:
+        reason = _required_reason(reason)
+        hold_path = self.root / "publish-hold.json"
+        try:
+            hold = _decode_object(hold_path.read_bytes(), "publish-hold.json")
+        except OSError as error:
+            raise PublishHold("No publish hold exists to resume") from error
+        target = hold.get("target_release_id")
+        if not isinstance(target, str) or RELEASE_ID_PATTERN.fullmatch(target) is None:
+            raise PublishHold("publish-hold.json is invalid")
+        created_at = self._now_string()
+        receipt = {
+            "schema_version": 1,
+            "action": "resume",
+            "target_release_id": target,
+            "reason": reason,
+            "created_at": created_at,
+        }
+        path = self._write_receipt(receipt, created_at)
+        self._ownership_check()
+        hold_path.unlink()
+        _fsync_directory(self.root)
+        return OperatorResult("resume", target, path, None)
+
+    def _ensure_artifacts(self, release: LocalRelease) -> tuple[int, int]:
+        uploaded = 0
+        skipped = 0
+        for relative, content in _release_artifacts(release):
+            key = f"{OBJECT_PREFIX}/releases/{release.release_id}/{relative}"
+            self._ownership_check()
+            observed = self.object_store.stat(key)
+            if observed is None:
+                self.object_store.put(
+                    key,
+                    content,
+                    cache_control=IMMUTABLE_CACHE_CONTROL,
+                )
+                confirmed = self.object_store.stat(key)
+                _confirm_object(
+                    key,
+                    confirmed,
+                    content,
+                    IMMUTABLE_CACHE_CONTROL,
+                    conflict=False,
+                )
+                uploaded += 1
+            else:
+                _confirm_object(
+                    key,
+                    observed,
+                    content,
+                    IMMUTABLE_CACHE_CONTROL,
+                    conflict=True,
+                )
+                skipped += 1
+            self._fault("after_artifact_confirmed", key)
+        return uploaded, skipped
+
+    def _put_pointer(self, release: LocalRelease) -> PublishedPointer:
+        manifest_bytes = (release.path / "manifest.json").read_bytes()
+        self._fault("before_pointer_put", POINTER_KEY)
+        self._ownership_check()
+        self.object_store.put(
+            POINTER_KEY,
+            manifest_bytes,
+            cache_control=POINTER_CACHE_CONTROL,
+        )
+        confirmed = self.object_store.stat(POINTER_KEY)
+        _confirm_object(
+            POINTER_KEY,
+            confirmed,
+            manifest_bytes,
+            POINTER_CACHE_CONTROL,
+            conflict=False,
+        )
+        observed = self.object_store.get(POINTER_KEY)
+        if observed is None or observed.body != manifest_bytes:
+            raise PublishConfirmationError("Pointer GET differs after publication")
+        _confirm_object(
+            POINTER_KEY,
+            observed.stat,
+            manifest_bytes,
+            POINTER_CACHE_CONTROL,
+            conflict=False,
+        )
+        return _parse_pointer(observed, self.contracts_dir)
+
+    def _write_receipt(self, receipt: Mapping[str, Any], created_at: str) -> Path:
+        receipts = self.root / "receipts"
+        self._ownership_check()
+        receipts.mkdir(parents=True, exist_ok=True)
+        stamp = created_at.replace("-", "").replace(":", "").replace(".", "")
+        path = receipts / f"{stamp}-{uuid.uuid4().hex}.json"
+        _durable_write(path, canonical_json(receipt))
+        _fsync_directory(receipts)
+        return path
+
+    def _now_string(self) -> str:
+        value = self._clock()
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("Publisher clock must be timezone-aware")
+        return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def build(
@@ -1102,6 +1352,10 @@ def _validate_payload(path: Path, contracts_dir: Path) -> None:
         value = _decode_object(path.read_bytes(), path.as_posix())
     except OSError as error:
         raise ContractViolation(f"Payload is unreadable: {path.name}") from error
+    _validate_payload_value(value, contracts_dir)
+
+
+def _validate_payload_value(value: Mapping[str, Any], contracts_dir: Path) -> None:
     kind = value.get("kind")
     schema_name = _SCHEMA_FILES.get(str(kind))
     if schema_name is None:
@@ -1115,6 +1369,58 @@ def _validate_payload(path: Path, contracts_dir: Path) -> None:
     if errors:
         location = "/".join(str(item) for item in errors[0].absolute_path) or "<root>"
         raise ContractViolation(f"{kind} violates its frozen contract at {location}: {errors[0].message}")
+
+
+def _parse_pointer(observed: StoredObject, contracts_dir: Path) -> PublishedPointer:
+    try:
+        manifest = _decode_object(observed.body, "public pointer")
+        _validate_payload_value(manifest, contracts_dir)
+        release_id = manifest.get("release_id")
+        window = manifest.get("window")
+        window_end = window.get("end") if isinstance(window, dict) else None
+        end = parse_source_day(window_end) if isinstance(window_end, str) else None
+    except (ReleaseBuildError, TypeError, ValueError) as error:
+        raise InvalidPointer("Public pointer does not match the frozen manifest contract") from error
+    if (
+        end is None
+        or not isinstance(release_id, str)
+        or RELEASE_ID_PATTERN.fullmatch(release_id) is None
+        or not release_id.startswith(f"{end.isoformat()}-")
+        or canonical_json(manifest) != observed.body
+        or observed.stat.cache_control != POINTER_CACHE_CONTROL
+    ):
+        raise InvalidPointer("Public pointer identity or Cache-Control is invalid")
+    return PublishedPointer(release_id, end.isoformat(), manifest, observed.stat)
+
+
+def _release_artifacts(release: LocalRelease) -> list[tuple[str, bytes]]:
+    return [
+        (path.relative_to(release.path).as_posix(), path.read_bytes())
+        for path in sorted(release.path.rglob("*"))
+        if path.is_file()
+    ]
+
+
+def _confirm_object(
+    key: str,
+    observed: ObjectStat | None,
+    content: bytes,
+    cache_control: str,
+    *,
+    conflict: bool,
+) -> None:
+    digest = hashlib.sha256(content).hexdigest()
+    matches = (
+        observed is not None
+        and observed.sha256 == digest
+        and observed.bytes == len(content)
+        and observed.cache_control == cache_control
+    )
+    if matches:
+        return
+    if conflict:
+        raise ImmutableObjectConflict(f"Immutable object differs: {key}")
+    raise PublishConfirmationError(f"Object confirmation differs: {key}")
 
 
 def _verify_manifest(stage: Path) -> Mapping[str, Any]:
@@ -1179,6 +1485,12 @@ def _generated_at(source_day: date | str) -> str:
     return f"{(parse_source_day(source_day) + timedelta(days=1)).isoformat()}T00:00:00Z"
 
 
+def _required_reason(value: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Operator reason is required")
+    return value.strip()
+
+
 def _default_contracts_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "contracts" / "v5"
 
@@ -1193,6 +1505,24 @@ def _durable_write(path: Path, content: bytes) -> None:
         stream.write(content)
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def _atomic_replace_file(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
 
 
 def _fsync_directory(path: Path) -> None:

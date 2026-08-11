@@ -18,8 +18,16 @@ import uuid
 from bpp_analyzer.bundle_source import HourExpired, RawHourIndex, RetryableSourceError
 from bpp_analyzer.fact_store import FactStore, parse_source_day
 from bpp_analyzer.locking import DirectoryLock, LockOwnershipLost
+from bpp_analyzer.object_store import ObjectStore
 from bpp_analyzer.projection import project_hour
-from bpp_analyzer.release import EPOCH_DAY, ReleaseBuilder, local_newest_release_id
+from bpp_analyzer.release import (
+    EPOCH_DAY,
+    PublishedPointer,
+    RELEASE_ID_PATTERN,
+    ReleaseBuilder,
+    ReleasePublisher,
+    local_newest_release_id,
+)
 
 
 DEFAULT_HEAL_DAYS = 8
@@ -68,9 +76,16 @@ class PipelineDriver:
         max_run_seconds: float = 7200,
         duckdb_memory_limit: str = "8GB",
         duckdb_threads: int = 8,
+        object_store: ObjectStore | None = None,
+        keep_releases: int = 3,
+        fact_fault_injector: Callable[[str, Path], None] | None = None,
+        release_fault_injector: Callable[[str, Path], None] | None = None,
+        publish_fault_injector: Callable[[str, str], None] | None = None,
     ) -> None:
         if settle_lag <= timedelta():
             raise ValueError("Settle lag must be positive")
+        if not isinstance(keep_releases, int) or isinstance(keep_releases, bool) or keep_releases < 1:
+            raise ValueError("keep_releases must be a positive integer")
         self.data_root = Path(data_root)
         self.source = source
         self.clock = clock
@@ -80,6 +95,11 @@ class PipelineDriver:
         self.max_run_seconds = max_run_seconds
         self.duckdb_memory_limit = duckdb_memory_limit
         self.duckdb_threads = duckdb_threads
+        self.object_store = object_store
+        self.keep_releases = keep_releases
+        self.fact_fault_injector = fact_fault_injector
+        self.release_fault_injector = release_fault_injector
+        self.publish_fault_injector = publish_fault_injector
 
     def run(
         self,
@@ -95,6 +115,10 @@ class PipelineDriver:
         now = _aware_utc(self.clock())
         run_id = uuid.uuid4().hex
         if dry_run:
+            if self.object_store is not None:
+                ReleasePublisher(
+                    self.data_root, self.object_store
+                ).current_pointer()
             return _summary(
                 run_id,
                 now,
@@ -120,6 +144,18 @@ class PipelineDriver:
                 self.data_root,
                 clock=self.clock,
                 ownership_check=lock.assert_owned,
+                fault_injector=self.fact_fault_injector,
+            )
+            publisher = (
+                ReleasePublisher(
+                    self.data_root,
+                    self.object_store,
+                    clock=self.clock,
+                    ownership_check=lock.assert_owned,
+                    fault_injector=self.publish_fault_injector,
+                )
+                if self.object_store is not None
+                else None
             )
             run_log = _RunLog(
                 self.data_root,
@@ -132,6 +168,7 @@ class PipelineDriver:
                 run_log.write(f"stale lock taken over: {lock.stale_run_id}")
             started_monotonic = time.monotonic()
             summary: RunSummary | None = None
+            published_pointer: PublishedPointer | None = None
             try:
                 summary = self._heal(
                     store,
@@ -147,6 +184,7 @@ class PipelineDriver:
                 selected_anchor = parsed_anchor or (
                     parse_source_day(seals[-1].source_day) if seals else None
                 )
+                local = None
                 if selected_anchor is not None:
                     local = ReleaseBuilder(
                         self.data_root,
@@ -154,6 +192,7 @@ class PipelineDriver:
                         memory_limit=self.duckdb_memory_limit,
                         threads=self.duckdb_threads,
                         ownership_check=lock.assert_owned,
+                        fault_injector=self.release_fault_injector,
                     ).build(selected_anchor, seals)
                     if local.reused:
                         run_log.write(f"release reused: {local.release_id}")
@@ -164,8 +203,40 @@ class PipelineDriver:
                             outcome="ok" if summary.outcome == "noop" else summary.outcome,
                             release_built=local.release_id,
                         )
-                    if publish:
-                        run_log.write("release publish deferred until Phase 3")
+                publish_started = time.monotonic()
+                if publisher is not None:
+                    published_pointer = publisher.current_pointer()
+                    hold = (self.data_root / "publish-hold.json").is_file()
+                    if (
+                        local is not None
+                        and publish
+                        and not hold
+                        and (
+                            published_pointer is None
+                            or local.release_id != published_pointer.release_id
+                        )
+                    ):
+                        published = publisher.publish(
+                            local,
+                            current=published_pointer,
+                        )
+                        published_pointer = published.pointer
+                        run_log.write(f"release published: {local.release_id}")
+                        summary = replace(
+                            summary,
+                            outcome="ok" if summary.outcome == "noop" else summary.outcome,
+                            release_published=local.release_id,
+                        )
+                if summary.exit_code == 0:
+                    _prune_releases(
+                        self.data_root,
+                        keep=self.keep_releases,
+                        published_release_id=(
+                            published_pointer.release_id if published_pointer else None
+                        ),
+                        ownership_check=lock.assert_owned,
+                    )
+                    _prune_logs(self.data_root, self.clock(), lock.assert_owned)
                 summary = replace(
                     summary,
                     finished_at=_aware_utc(self.clock()).isoformat().replace("+00:00", "Z"),
@@ -176,6 +247,9 @@ class PipelineDriver:
                         ),
                         "build_seconds": round(
                             max(time.monotonic() - build_started, 0.0), 6
+                        ),
+                        "publish_seconds": round(
+                            max(time.monotonic() - publish_started, 0.0), 6
                         ),
                     },
                     peak_rss_bytes=peak_rss_bytes(),
@@ -227,6 +301,7 @@ class PipelineDriver:
                     summary,
                     now=_aware_utc(self.clock()),
                     considered_days=healing_days(now, heal_days),
+                    published_pointer=published_pointer,
                 )
             except LockOwnershipLost:
                 raise
@@ -244,12 +319,15 @@ class PipelineDriver:
                     peak_rss_bytes=peak_rss_bytes(),
                 )
                 run_log.write(f"status collection failed: {reason}")
-                status = _error_status(self.data_root, summary)
+                status = _error_status(
+                    self.data_root,
+                    summary,
+                    published_pointer,
+                    now=_aware_utc(self.clock()),
+                )
             _write_status(self.data_root, status, lock.assert_owned)
             _append_run(self.data_root, summary.to_dict(), lock.assert_owned)
             run_log.write(f"run finished: {summary.outcome}")
-            if summary.exit_code == 0:
-                _prune_logs(self.data_root, self.clock(), lock.assert_owned)
             return summary
 
     def _heal(
@@ -392,6 +470,7 @@ def build_status(
     *,
     now: datetime,
     considered_days: tuple[date, ...] | None = None,
+    published_pointer: PublishedPointer | None = None,
 ) -> dict[str, Any]:
     root = Path(data_root)
     seals = store.seals()
@@ -424,6 +503,12 @@ def build_status(
                 }
             )
     disk_root = _existing_ancestor(root)
+    checked_at = _aware_utc(now)
+    published_age = (
+        max(0.0, (checked_at - published_pointer.stat.last_modified).total_seconds())
+        if published_pointer is not None
+        else None
+    )
     return {
         "facts": {
             "newest_sealed_day": max(sealed_days, default=None),
@@ -442,9 +527,13 @@ def build_status(
         "release": {
             "publish_hold": (root / "publish-hold.json").is_file(),
             "local_newest_release_id": local_newest_release_id(root),
-            "published_release_id": None,
-            "published_window_end": None,
-            "published_manifest_age_seconds": None,
+            "published_release_id": (
+                published_pointer.release_id if published_pointer is not None else None
+            ),
+            "published_window_end": (
+                published_pointer.window_end if published_pointer is not None else None
+            ),
+            "published_manifest_age_seconds": published_age,
         },
         "last_run": last_run.to_dict() if last_run is not None else None,
         "disk": {"free_bytes": shutil.disk_usage(disk_root).free},
@@ -475,7 +564,21 @@ def peak_rss_bytes() -> int:
     return observed if sys.platform == "darwin" else observed * 1024
 
 
-def _error_status(root: Path, summary: RunSummary) -> dict[str, Any]:
+def _error_status(
+    root: Path,
+    summary: RunSummary,
+    published_pointer: PublishedPointer | None = None,
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    published_age = (
+        max(
+            0.0,
+            (_aware_utc(now) - published_pointer.stat.last_modified).total_seconds(),
+        )
+        if published_pointer is not None
+        else None
+    )
     return {
         "facts": {
             "newest_sealed_day": None,
@@ -486,9 +589,13 @@ def _error_status(root: Path, summary: RunSummary) -> dict[str, Any]:
         "release": {
             "publish_hold": (root / "publish-hold.json").is_file(),
             "local_newest_release_id": local_newest_release_id(root),
-            "published_release_id": None,
-            "published_window_end": None,
-            "published_manifest_age_seconds": None,
+            "published_release_id": (
+                published_pointer.release_id if published_pointer is not None else None
+            ),
+            "published_window_end": (
+                published_pointer.window_end if published_pointer is not None else None
+            ),
+            "published_manifest_age_seconds": published_age,
         },
         "last_run": summary.to_dict(),
         "disk": {"free_bytes": shutil.disk_usage(_existing_ancestor(root)).free},
@@ -620,6 +727,47 @@ class _RunLog:
             stream.write(f"{timestamp} {message}\n")
             stream.flush()
             os.fsync(stream.fileno())
+
+
+def _prune_releases(
+    root: Path,
+    *,
+    keep: int,
+    published_release_id: str | None,
+    ownership_check: Callable[[], None],
+) -> None:
+    releases = root / "releases"
+    if not releases.is_dir():
+        return
+    release_ids = sorted(
+        (
+            path.name
+            for path in releases.iterdir()
+            if path.is_dir() and RELEASE_ID_PATTERN.fullmatch(path.name)
+        ),
+        reverse=True,
+    )
+    protected = set(release_ids[:keep])
+    if published_release_id is not None:
+        protected.add(published_release_id)
+    hold_path = root / "publish-hold.json"
+    try:
+        hold = json.loads(hold_path.read_bytes())
+    except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError):
+        hold = None
+    if isinstance(hold, dict):
+        target = hold.get("target_release_id")
+        if isinstance(target, str) and RELEASE_ID_PATTERN.fullmatch(target):
+            protected.add(target)
+    removed = False
+    for release_id in release_ids:
+        if release_id in protected:
+            continue
+        ownership_check()
+        shutil.rmtree(releases / release_id)
+        removed = True
+    if removed:
+        _fsync_directory(releases)
 
 
 def _prune_logs(

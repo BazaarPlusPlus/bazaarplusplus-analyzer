@@ -1,6 +1,6 @@
 [project]
 name = "bpp-analyzer"
-version = "0.2.0"
+version = "0.3.0"
 description = "Analyzer V5 rebuild: single-process pipeline publishing the analyzer-v5 contract"
 requires-python = ">=3.13"
 dependencies = [

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 
 import click
 
@@ -10,10 +11,13 @@ from bpp_analyzer.bundle_source import BundleSource
 from bpp_analyzer.config import ConfigurationError, load_config
 from bpp_analyzer.driver import PipelineDriver, read_status
 from bpp_analyzer.fact_store import FactStore, FactStoreError, parse_source_day
-from bpp_analyzer.locking import LockHeld, LockOwnershipLost
+from bpp_analyzer.locking import DirectoryLock, LockHeld, LockOwnershipLost
+from bpp_analyzer.object_store import ObjectStoreError, R2ObjectStore
 from bpp_analyzer.release import (
+    PublishError,
     ReleaseBuildError,
     ReleaseBuilder,
+    ReleasePublisher,
     validate_local_releases,
 )
 
@@ -38,8 +42,16 @@ def run_command(
     try:
         if anchor_day is not None:
             parse_source_day(anchor_day)
-        config = load_config(require_source=not dry_run)
+        config = load_config(
+            require_source=not dry_run,
+            require_object_store=True,
+        )
+        object_store = _object_store(config)
         if dry_run:
+            pointer = ReleasePublisher(
+                config.data_root,
+                object_store,
+            ).current_pointer()
             click.echo(
                 json.dumps(
                     {
@@ -47,6 +59,9 @@ def run_command(
                         "heal_days": heal_days,
                         "anchor_day": anchor_day,
                         "publish": not no_publish,
+                        "published_release_id": (
+                            pointer.release_id if pointer is not None else None
+                        ),
                     },
                     sort_keys=True,
                     separators=(",", ":"),
@@ -67,6 +82,8 @@ def run_command(
                 max_run_seconds=config.max_run_seconds,
                 duckdb_memory_limit=config.duckdb_memory_limit,
                 duckdb_threads=config.duckdb_threads,
+                object_store=object_store,
+                keep_releases=config.keep_releases,
             ).run(
                 heal_days=heal_days,
                 anchor_day=anchor_day,
@@ -85,7 +102,7 @@ def run_command(
         raise click.UsageError(str(error)) from None
     except LockOwnershipLost as error:
         raise click.ClickException(str(error)) from None
-    except ReleaseBuildError as error:
+    except (ReleaseBuildError, PublishError, ObjectStoreError) as error:
         raise click.ClickException(str(error)) from None
 
 
@@ -136,26 +153,67 @@ def verify_command(day: str | None, deep: bool) -> None:
 @main.command("publish")
 @click.argument("release_id")
 def publish_command(release_id: str) -> None:
-    """Publish an already-built release (available in Phase 3)."""
-    del release_id
-    raise click.ClickException("Release publishing is not implemented until Phase 3")
+    """Publish an already-built release."""
+    try:
+        config = load_config(require_source=False, require_object_store=True)
+        with _operator_lock(config) as lock:
+            builder = _release_builder(config)
+            result = ReleasePublisher(
+                config.data_root,
+                _object_store(config),
+                ownership_check=lock.assert_owned,
+            ).publish(builder.local(release_id))
+    except LockHeld:
+        raise click.exceptions.Exit(3) from None
+    except ConfigurationError as error:
+        raise click.UsageError(str(error)) from None
+    except (ReleaseBuildError, PublishError, ObjectStoreError) as error:
+        raise click.ClickException(str(error)) from None
+    click.echo(f"published {result.release_id}")
 
 
 @main.command("rollback")
 @click.argument("release_id")
 @click.option("--reason", required=True)
 def rollback_command(release_id: str, reason: str) -> None:
-    """Roll back the public pointer (available after the publish phase)."""
-    del release_id, reason
-    raise click.ClickException("Release rollback is not implemented until Phase 3")
+    """Roll back the public pointer and establish a publish hold."""
+    try:
+        config = load_config(require_source=False, require_object_store=True)
+        with _operator_lock(config) as lock:
+            builder = _release_builder(config)
+            result = ReleasePublisher(
+                config.data_root,
+                _object_store(config),
+                ownership_check=lock.assert_owned,
+            ).rollback(builder.local(release_id), reason)
+    except LockHeld:
+        raise click.exceptions.Exit(3) from None
+    except (ConfigurationError, ValueError) as error:
+        raise click.UsageError(str(error)) from None
+    except (ReleaseBuildError, PublishError, ObjectStoreError) as error:
+        raise click.ClickException(str(error)) from None
+    click.echo(f"rolled back to {result.release_id}")
 
 
 @main.command("resume")
 @click.option("--reason", required=True)
 def resume_command(reason: str) -> None:
-    """Clear a publish hold (available after the publish phase)."""
-    del reason
-    raise click.ClickException("Release resume is not implemented until Phase 3")
+    """Clear a publish hold with a recorded reason."""
+    try:
+        config = load_config(require_source=False, require_object_store=True)
+        with _operator_lock(config) as lock:
+            result = ReleasePublisher(
+                config.data_root,
+                _object_store(config),
+                ownership_check=lock.assert_owned,
+            ).resume(reason)
+    except LockHeld:
+        raise click.exceptions.Exit(3) from None
+    except (ConfigurationError, ValueError) as error:
+        raise click.UsageError(str(error)) from None
+    except (PublishError, ObjectStoreError) as error:
+        raise click.ClickException(str(error)) from None
+    click.echo(f"resumed publishing from hold target {result.release_id}")
 
 
 @main.group("show")
@@ -179,6 +237,35 @@ def show_release_command(release_id: str) -> None:
     except ReleaseBuildError as error:
         raise click.ClickException(str(error)) from None
     click.echo(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
+
+
+def _release_builder(config):
+    return ReleaseBuilder(
+        config.data_root,
+        memory_limit=config.duckdb_memory_limit,
+        threads=config.duckdb_threads,
+    )
+
+
+def _operator_lock(config):
+    return DirectoryLock(
+        config.data_root,
+        f"operator-{uuid.uuid4().hex}",
+        max_run_seconds=config.max_run_seconds,
+    )
+
+
+def _object_store(config):
+    assert config.r2_account_id is not None
+    assert config.r2_bucket is not None
+    assert config.r2_access_key_id is not None
+    assert config.r2_secret_access_key is not None
+    return R2ObjectStore(
+        account_id=config.r2_account_id,
+        bucket=config.r2_bucket,
+        access_key_id=config.r2_access_key_id,
+        secret_access_key=config.r2_secret_access_key,
+    )
 
 
 if __name__ == "__main__":

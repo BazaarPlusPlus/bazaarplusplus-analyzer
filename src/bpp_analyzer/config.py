@@ -24,13 +24,23 @@ class Config:
     max_run_seconds: int = 7200
     duckdb_memory_limit: str = "8GB"
     duckdb_threads: int = 8
+    keep_releases: int = 3
+    r2_account_id: str | None = None
+    r2_bucket: str | None = None
+    r2_access_key_id: str | None = field(default=None, repr=False)
+    r2_secret_access_key: str | None = field(default=None, repr=False)
 
 
 def repository_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def load_config(*, require_source: bool = True, root: Path | None = None) -> Config:
+def load_config(
+    *,
+    require_source: bool = True,
+    require_object_store: bool = False,
+    root: Path | None = None,
+) -> Config:
     repo = (root or repository_root()).resolve()
     env_file = repo / ".env"
     if not env_file.is_file():
@@ -46,6 +56,14 @@ def load_config(*, require_source: bool = True, root: Path | None = None) -> Con
     sync_token = _optional(values.get("BPP_BUNDLE_SYNC_TOKEN"))
     if require_source and (api_base_url is None or sync_token is None):
         raise ConfigurationError("Bundle Server configuration is incomplete")
+    r2_account_id = _optional(values.get("BPP_METRICS_R2_ACCOUNT_ID"))
+    r2_bucket = _optional(values.get("BPP_METRICS_R2_BUCKET"))
+    r2_access_key_id = _optional(values.get("BPP_METRICS_R2_ACCESS_KEY_ID"))
+    r2_secret_access_key = _optional(values.get("BPP_METRICS_R2_SECRET_ACCESS_KEY"))
+    if require_object_store and not all(
+        (r2_account_id, r2_bucket, r2_access_key_id, r2_secret_access_key)
+    ):
+        raise ConfigurationError("R2 object-store configuration is incomplete")
     return Config(
         data_root=data_root,
         api_base_url=api_base_url,
@@ -66,6 +84,13 @@ def load_config(*, require_source: bool = True, root: Path | None = None) -> Con
         duckdb_threads=_positive_int(
             values.get("BPP_DUCKDB_THREADS"), 8, "BPP_DUCKDB_THREADS"
         ),
+        keep_releases=_positive_int(
+            values.get("BPP_KEEP_RELEASES"), 3, "BPP_KEEP_RELEASES"
+        ),
+        r2_account_id=r2_account_id,
+        r2_bucket=r2_bucket,
+        r2_access_key_id=r2_access_key_id,
+        r2_secret_access_key=r2_secret_access_key,
     )
 
 

@@ -18,15 +18,20 @@ CARD_IDS = tuple(
 def sealed_store(root: Path, days: int, *, start: date = date(2026, 8, 7)) -> FactStore:
     store = FactStore(root)
     for offset in range(days):
-        source_day = start + timedelta(days=offset)
-        for hour_number in range(24):
-            source_hour = datetime.combine(source_day, datetime.min.time(), UTC) + timedelta(
-                hours=hour_number
-            )
-            rows = _populated_rows(source_hour, offset) if hour_number == 0 else {}
-            store.commit_hour(_projection(source_hour, rows))
-        store.seal_day(source_day)
+        commit_sealed_day(store, start + timedelta(days=offset), day_offset=offset)
     return store
+
+
+def commit_sealed_day(
+    store: FactStore, source_day: date, *, day_offset: int = 0
+) -> None:
+    for hour_number in range(24):
+        source_hour = datetime.combine(source_day, datetime.min.time(), UTC) + timedelta(
+            hours=hour_number
+        )
+        rows = _populated_rows(source_hour, day_offset) if hour_number == 0 else {}
+        store.commit_hour(_projection(source_hour, rows))
+    store.seal_day(source_day)
 
 
 def _projection(

@@ -231,6 +231,8 @@ class FactStore:
         self._ownership_check()
         self._sealed.mkdir(parents=True, exist_ok=True)
         destination = self._seal_path(day)
+        self._fault("before_seal_promote", destination)
+        self._ownership_check()
         reused = _atomic_immutable_file(destination, content)
         return DaySeal(
             source_day=day_key,
