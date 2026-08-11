@@ -10,7 +10,8 @@ import hashlib
 import json
 import re
 import threading
-from typing import Any
+import time
+from typing import Any, TypeVar
 
 import httpx
 
@@ -23,6 +24,9 @@ MAX_RUN_BYTES = 2_097_151
 MAX_SCREENSHOT_BYTES = 1_048_576
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+RETRY_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
+
+_T = TypeVar("_T")
 
 
 class BundleSourceError(RuntimeError):
@@ -124,6 +128,7 @@ class BundleSource:
         download_concurrency: int = 4,
         lookahead: int = 8,
         page_limit: int = 200,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if not api_base_url or not sync_token:
             raise ValueError("Bundle Server URL and sync token are required")
@@ -142,6 +147,7 @@ class BundleSource:
         self._download_concurrency = download_concurrency
         self._lookahead = lookahead
         self._page_limit = page_limit
+        self._sleep = sleep
         self._refresh_lock = threading.Lock()
 
     def close(self) -> None:
@@ -171,17 +177,7 @@ class BundleSource:
             if cursor is not None:
                 params["after_available_at_ms"] = str(cursor[0])
                 params["after_bundle_id"] = cursor[1]
-            try:
-                response = self._client.get(
-                    f"{self._api_base_url}/bundles",
-                    params=params,
-                    headers={"Authorization": f"Bearer {self._sync_token}"},
-                )
-            except httpx.TransportError as error:
-                raise RetryableSourceError(
-                    "source_transport_error", "Bundle collection transport failed"
-                ) from error
-            self._raise_response_error(response)
+            response = self._retry(lambda: self._listing_request(params))
             try:
                 payload = response.json()
             except ValueError as error:
@@ -237,6 +233,30 @@ class BundleSource:
             raw_commit_sha256=raw_commit_sha256(items),
             pages=pages,
         )
+
+    def _listing_request(self, params: Mapping[str, str]) -> httpx.Response:
+        try:
+            response = self._client.get(
+                f"{self._api_base_url}/bundles",
+                params=params,
+                headers={"Authorization": f"Bearer {self._sync_token}"},
+            )
+        except httpx.TransportError as error:
+            raise RetryableSourceError(
+                "source_transport_error", "Bundle collection transport failed"
+            ) from error
+        self._raise_response_error(response)
+        return response
+
+    def _retry(self, operation: Callable[[], _T]) -> _T:
+        for attempt in range(len(RETRY_BACKOFF_SECONDS) + 1):
+            try:
+                return operation()
+            except RetryableSourceError:
+                if attempt == len(RETRY_BACKOFF_SECONDS):
+                    raise
+                self._sleep(RETRY_BACKOFF_SECONDS[attempt])
+        raise AssertionError("Retry loop must return or raise")
 
     def stream(self, index: RawHourIndex) -> Iterator[Bundle]:
         """Yield at most ``lookahead`` retained downloads, in index order."""
@@ -301,19 +321,41 @@ class BundleSource:
         return Bundle(item, content, digest, len(content))
 
     def _download(self, item: BundleRef) -> bytes:
+        return self._retry(lambda: self._download_once(item))
+
+    def _download_once(self, item: BundleRef) -> bytes:
         try:
             with self._client.stream("GET", item.download_url) as response:
+                if response.status_code >= 400:
+                    response.read()
+                    code, body_retryable = _response_error_details(response)
+                else:
+                    code, body_retryable = None, False
+                if response.status_code == 410 and code == "window_expired":
+                    raise HourExpired(
+                        code, "The Bundle Server no longer retains this hour"
+                    )
                 if response.status_code == 403:
                     raise DownloadUrlExpired(
                         "download_url_expired", "Bundle download capability expired"
                     )
-                if response.status_code in {408, 429} or response.status_code >= 500:
+                if response.status_code == 401:
+                    raise SourceContractError(
+                        code or "bundle_download_failed",
+                        "Bundle download authentication failed",
+                    )
+                if (
+                    response.status_code in {408, 429}
+                    or response.status_code >= 500
+                    or body_retryable
+                ):
                     raise RetryableSourceError(
-                        "bundle_download_retryable", "Bundle download temporarily failed"
+                        code or "bundle_download_retryable",
+                        "Bundle download temporarily failed",
                     )
                 if response.status_code >= 400:
                     raise SourceContractError(
-                        "bundle_download_failed", "Bundle download was rejected"
+                        code or "bundle_download_failed", "Bundle download was rejected"
                     )
                 declared_length: int | None = None
                 if "Content-Length" in response.headers:
@@ -361,18 +403,12 @@ class BundleSource:
     def _raise_response_error(response: httpx.Response) -> None:
         if response.status_code < 400:
             return
-        code = "source_request_failed"
-        retryable = False
-        try:
-            payload = response.json()
-            error = payload.get("error") if isinstance(payload, dict) else None
-            if isinstance(error, dict):
-                code = error.get("code") if isinstance(error.get("code"), str) else code
-                retryable = error.get("retryable") is True
-        except ValueError:
-            pass
+        observed_code, retryable = _response_error_details(response)
+        code = observed_code or "source_request_failed"
         if response.status_code == 410:
             raise HourExpired(code, "The Bundle Server no longer retains this hour")
+        if response.status_code in {401, 403}:
+            raise SourceContractError(code, "Bundle collection authentication failed")
         if response.status_code in {408, 429} or response.status_code >= 500 or retryable:
             raise RetryableSourceError(code, "Bundle collection temporarily failed")
         raise SourceContractError(code, "Bundle collection request was rejected")
@@ -622,6 +658,18 @@ def _canonical_json(value: object) -> bytes:
         json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         + "\n"
     ).encode("utf-8")
+
+
+def _response_error_details(response: httpx.Response) -> tuple[str | None, bool]:
+    try:
+        payload = response.json()
+    except ValueError:
+        return None, False
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict):
+        return None, False
+    code = error.get("code")
+    return (code if isinstance(code, str) else None), error.get("retryable") is True
 
 
 def _mapping(value: object, field: str) -> Mapping[str, Any]:
