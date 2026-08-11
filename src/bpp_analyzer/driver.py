@@ -1,0 +1,585 @@
+"""Oldest-first heal/seal convergence and local health reporting."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, replace
+from datetime import UTC, date, datetime, timedelta
+import json
+import os
+from pathlib import Path
+import resource
+import shutil
+import sys
+import tempfile
+import time
+from typing import Any, Callable, Protocol
+import uuid
+
+from bpp_analyzer.bundle_source import HourExpired, RawHourIndex, RetryableSourceError
+from bpp_analyzer.fact_store import FactStore, parse_source_day
+from bpp_analyzer.locking import DirectoryLock
+from bpp_analyzer.projection import project_hour
+
+
+EPOCH_DAY = date(2026, 8, 7)
+DEFAULT_HEAL_DAYS = 8
+DEFAULT_SETTLE_LAG = timedelta(seconds=60)
+
+
+class Source(Protocol):
+    def hour_index(self, source_hour: datetime) -> RawHourIndex: ...
+    def stream(self, index: RawHourIndex): ...
+
+
+@dataclass(frozen=True, slots=True)
+class RunSummary:
+    run_id: str
+    started_at: str
+    finished_at: str
+    timings: dict[str, float]
+    outcome: str
+    exit_code: int
+    hours_ingested: int
+    days_sealed: int
+    days_abandoned: int
+    release_built: str | None
+    release_published: str | None
+    failures: tuple[dict[str, str], ...]
+    peak_rss_bytes: int
+
+    def to_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        value["failures"] = list(self.failures)
+        return value
+
+
+class PipelineDriver:
+    """Converge recoverable Source Hours into immutable local facts."""
+
+    def __init__(
+        self,
+        data_root: str | Path,
+        *,
+        source: Source,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        settle_lag: timedelta = DEFAULT_SETTLE_LAG,
+        heartbeat_interval: float = 30,
+        stale_after: float = 300,
+        max_run_seconds: float = 7200,
+    ) -> None:
+        if settle_lag <= timedelta():
+            raise ValueError("Settle lag must be positive")
+        self.data_root = Path(data_root)
+        self.source = source
+        self.clock = clock
+        self.settle_lag = settle_lag
+        self.heartbeat_interval = heartbeat_interval
+        self.stale_after = stale_after
+        self.max_run_seconds = max_run_seconds
+
+    def run(
+        self,
+        *,
+        heal_days: int = DEFAULT_HEAL_DAYS,
+        anchor_day: date | str | None = None,
+        publish: bool = True,
+        dry_run: bool = False,
+    ) -> RunSummary:
+        if not isinstance(heal_days, int) or isinstance(heal_days, bool) or heal_days < 1:
+            raise ValueError("heal_days must be a positive integer")
+        if anchor_day is not None:
+            parse_source_day(anchor_day)
+        del publish  # Release build/publish arrives in later phases.
+        now = _aware_utc(self.clock())
+        run_id = uuid.uuid4().hex
+        if dry_run:
+            return _summary(
+                run_id,
+                now,
+                now,
+                outcome="noop",
+                exit_code=0,
+                hours_ingested=0,
+                days_sealed=0,
+                days_abandoned=0,
+                failures=(),
+                elapsed=0.0,
+            )
+
+        lock = DirectoryLock(
+            self.data_root,
+            run_id,
+            heartbeat_interval=self.heartbeat_interval,
+            stale_after=self.stale_after,
+            max_run_seconds=self.max_run_seconds,
+        )
+        with lock:
+            store = FactStore(
+                self.data_root,
+                clock=self.clock,
+                ownership_check=lock.assert_owned,
+            )
+            run_log = _RunLog(
+                self.data_root,
+                run_id,
+                clock=self.clock,
+                ownership_check=lock.assert_owned,
+            )
+            run_log.write("run started")
+            if lock.stale_run_id is not None:
+                run_log.write(f"stale lock taken over: {lock.stale_run_id}")
+            started_monotonic = time.monotonic()
+            try:
+                summary = self._heal(
+                    store,
+                    lock,
+                    run_id=run_id,
+                    now=now,
+                    heal_days=heal_days,
+                    started_monotonic=started_monotonic,
+                    log=run_log.write,
+                )
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                finished = _aware_utc(self.clock())
+                summary = _summary(
+                    run_id,
+                    now,
+                    finished,
+                    outcome="error",
+                    exit_code=1,
+                    hours_ingested=0,
+                    days_sealed=0,
+                    days_abandoned=0,
+                    failures=(
+                        {
+                            "scope": "run",
+                            "reason": getattr(error, "reason", type(error).__name__),
+                        },
+                    ),
+                    elapsed=time.monotonic() - started_monotonic,
+                )
+                run_log.write(
+                    f"run failed: {getattr(error, 'reason', type(error).__name__)}"
+                )
+            lock.assert_owned()
+            try:
+                status = build_status(
+                    self.data_root,
+                    store,
+                    summary,
+                    now=_aware_utc(self.clock()),
+                    considered_days=healing_days(now, heal_days),
+                )
+            except LockOwnershipLost:
+                raise
+            except Exception as error:
+                reason = str(getattr(error, "reason", type(error).__name__))
+                summary = replace(
+                    summary,
+                    finished_at=_aware_utc(self.clock())
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    outcome="error",
+                    exit_code=1,
+                    failures=summary.failures
+                    + ({"scope": "status", "reason": reason},),
+                    peak_rss_bytes=peak_rss_bytes(),
+                )
+                run_log.write(f"status collection failed: {reason}")
+                status = _error_status(self.data_root, summary)
+            _write_status(self.data_root, status, lock.assert_owned)
+            _append_run(self.data_root, summary.to_dict(), lock.assert_owned)
+            run_log.write(f"run finished: {summary.outcome}")
+            if summary.exit_code == 0:
+                _prune_logs(self.data_root, self.clock(), lock.assert_owned)
+            return summary
+
+    def _heal(
+        self,
+        store: FactStore,
+        lock: DirectoryLock,
+        *,
+        run_id: str,
+        now: datetime,
+        heal_days: int,
+        started_monotonic: float,
+        log: Callable[[str], None],
+    ) -> RunSummary:
+        hours_ingested = 0
+        days_sealed = 0
+        days_abandoned = 0
+        failures: list[dict[str, str]] = []
+        changed = False
+        heal_started = time.monotonic()
+
+        for day in healing_days(now, heal_days):
+            lock.assert_owned()
+            if store.has_seal(day) or store.is_abandoned(day):
+                continue
+            missing = store.missing_hours(day)
+            expired_reason: str | None = None
+            for hour in settled_missing_hours(
+                day, now, missing, settle_lag=self.settle_lag
+            ):
+                lock.assert_owned()
+                try:
+                    index = self.source.hour_index(hour)
+                    projected = project_hour(index, self.source.stream(index))
+                    store.commit_hour(projected)
+                    hours_ingested += 1
+                    changed = True
+                except HourExpired as error:
+                    expired_reason = error.reason
+                    log(
+                        f"source hour expired: {hour.strftime('%Y-%m-%dT%H')} "
+                        f"({error.reason})"
+                    )
+                    break
+                except RetryableSourceError as error:
+                    failures.append(
+                        {
+                            "scope": "source_hour",
+                            "source_hour": hour.strftime("%Y-%m-%dT%H"),
+                            "reason": str(getattr(error, "reason", type(error).__name__)),
+                        }
+                    )
+                    log(
+                        f"source hour failed: {hour.strftime('%Y-%m-%dT%H')} "
+                        f"({getattr(error, 'reason', type(error).__name__)})"
+                    )
+                    continue
+                except Exception:
+                    raise
+
+            if expired_reason is not None:
+                remaining = store.missing_hours(day)
+                store.abandon_day(day, remaining, expired_reason)
+                log(f"source day abandoned: {day.isoformat()} ({expired_reason})")
+                days_abandoned += 1
+                changed = True
+                continue
+            try:
+                if not store.missing_hours(day):
+                    store.seal_day(day)
+                    log(f"source day sealed: {day.isoformat()}")
+                    days_sealed += 1
+                    changed = True
+            except Exception as error:
+                failures.append(
+                    {
+                        "scope": "source_day",
+                        "source_day": day.isoformat(),
+                        "reason": str(getattr(error, "reason", type(error).__name__)),
+                    }
+                )
+                log(
+                    f"source day failed: {day.isoformat()} "
+                    f"({getattr(error, 'reason', type(error).__name__)})"
+                )
+
+        finished = _aware_utc(self.clock())
+        outcome = "partial" if failures else "ok" if changed else "noop"
+        return _summary(
+            run_id,
+            now,
+            finished,
+            outcome=outcome,
+            exit_code=4 if failures else 0,
+            hours_ingested=hours_ingested,
+            days_sealed=days_sealed,
+            days_abandoned=days_abandoned,
+            failures=tuple(failures),
+            elapsed=time.monotonic() - started_monotonic,
+            heal_seconds=time.monotonic() - heal_started,
+        )
+
+
+def healing_days(now: datetime, count: int) -> tuple[date, ...]:
+    """Return the clamped oldest-first set of UTC days considered by a run."""
+    current = _aware_utc(now).date()
+    first = max(EPOCH_DAY, current - timedelta(days=count - 1))
+    if first > current:
+        return ()
+    return tuple(first + timedelta(days=offset) for offset in range((current - first).days + 1))
+
+
+def is_hour_settled(
+    source_hour: datetime, now: datetime, *, settle_lag: timedelta = DEFAULT_SETTLE_LAG
+) -> bool:
+    """Pure settled-hour rule: the fixed hour ended and the server lag elapsed."""
+    hour = _aware_utc(source_hour)
+    if hour.minute or hour.second or hour.microsecond:
+        raise ValueError("Source Hour must align to the hour")
+    return _aware_utc(now) >= hour + timedelta(hours=1) + settle_lag
+
+
+def settled_missing_hours(
+    source_day: date,
+    now: datetime,
+    missing: tuple[datetime, ...],
+    *,
+    settle_lag: timedelta = DEFAULT_SETTLE_LAG,
+) -> tuple[datetime, ...]:
+    if any(hour.date() != source_day for hour in missing):
+        raise ValueError("Missing Source Hours must belong to the Source Day")
+    return tuple(
+        sorted(hour for hour in missing if is_hour_settled(hour, now, settle_lag=settle_lag))
+    )
+
+
+def build_status(
+    data_root: str | Path,
+    store: FactStore,
+    last_run: RunSummary | None,
+    *,
+    now: datetime,
+    considered_days: tuple[date, ...] | None = None,
+) -> dict[str, Any]:
+    root = Path(data_root)
+    seals = store.seals()
+    abandoned = store.abandoned_days()
+    if considered_days is None:
+        candidate_days = {
+            date.fromisoformat(value[:10]) for value in store.committed_hours()
+        }
+        candidate_days.update(
+            date.fromisoformat(item.source_day) for item in abandoned
+        )
+        considered_days = tuple(sorted(candidate_days))
+    incomplete = []
+    sealed_days = {item.source_day for item in seals}
+    abandoned_days = {item.source_day for item in abandoned}
+    for day in considered_days:
+        if day.isoformat() in sealed_days or day.isoformat() in abandoned_days:
+            continue
+        missing = store.missing_hours(day)
+        if missing:
+            incomplete.append(
+                {
+                    "source_day": day.isoformat(),
+                    "missing_hours": [hour.strftime("%Y-%m-%dT%H") for hour in missing],
+                    "settled": is_hour_settled(
+                        datetime.combine(day, datetime.min.time(), UTC)
+                        + timedelta(hours=23),
+                        now,
+                    ),
+                }
+            )
+    disk_root = _existing_ancestor(root)
+    return {
+        "facts": {
+            "newest_sealed_day": max(sealed_days, default=None),
+            "sealed_days": sorted(sealed_days),
+            "incomplete_days": incomplete,
+            "abandoned_days": [
+                {
+                    "source_day": item.source_day,
+                    "missing_hours": list(item.missing_hours),
+                    "reason": item.reason,
+                    "abandoned_at": item.abandoned_at,
+                }
+                for item in abandoned
+            ],
+        },
+        "release": {
+            "publish_hold": (root / "publish-hold.json").is_file(),
+            "local_newest_release_id": None,
+            "published_release_id": None,
+            "published_window_end": None,
+            "published_manifest_age_seconds": None,
+        },
+        "last_run": last_run.to_dict() if last_run is not None else None,
+        "disk": {"free_bytes": shutil.disk_usage(disk_root).free},
+        "peak_rss_bytes": peak_rss_bytes(),
+    }
+
+
+def read_status(data_root: str | Path) -> dict[str, Any]:
+    path = Path(data_root) / "status.json"
+    try:
+        value = json.loads(path.read_bytes())
+    except FileNotFoundError:
+        return build_status(
+            data_root,
+            FactStore(data_root),
+            None,
+            now=datetime.now(UTC),
+        )
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise RuntimeError("status.json is unreadable") from error
+    if not isinstance(value, dict):
+        raise RuntimeError("status.json must contain an object")
+    return value
+
+
+def peak_rss_bytes() -> int:
+    observed = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    return observed if sys.platform == "darwin" else observed * 1024
+
+
+def _error_status(root: Path, summary: RunSummary) -> dict[str, Any]:
+    return {
+        "facts": {
+            "newest_sealed_day": None,
+            "sealed_days": [],
+            "incomplete_days": [],
+            "abandoned_days": [],
+        },
+        "release": {
+            "publish_hold": (root / "publish-hold.json").is_file(),
+            "local_newest_release_id": None,
+            "published_release_id": None,
+            "published_window_end": None,
+            "published_manifest_age_seconds": None,
+        },
+        "last_run": summary.to_dict(),
+        "disk": {"free_bytes": shutil.disk_usage(_existing_ancestor(root)).free},
+        "peak_rss_bytes": peak_rss_bytes(),
+    }
+
+
+def _summary(
+    run_id: str,
+    started: datetime,
+    finished: datetime,
+    *,
+    outcome: str,
+    exit_code: int,
+    hours_ingested: int,
+    days_sealed: int,
+    days_abandoned: int,
+    failures: tuple[dict[str, str], ...],
+    elapsed: float,
+    heal_seconds: float = 0.0,
+) -> RunSummary:
+    return RunSummary(
+        run_id=run_id,
+        started_at=started.isoformat().replace("+00:00", "Z"),
+        finished_at=finished.isoformat().replace("+00:00", "Z"),
+        timings={
+            "total_seconds": round(max(elapsed, 0.0), 6),
+            "heal_seconds": round(max(heal_seconds, 0.0), 6),
+        },
+        outcome=outcome,
+        exit_code=exit_code,
+        hours_ingested=hours_ingested,
+        days_sealed=days_sealed,
+        days_abandoned=days_abandoned,
+        release_built=None,
+        release_published=None,
+        failures=failures,
+        peak_rss_bytes=peak_rss_bytes(),
+    )
+
+
+def _write_status(
+    root: Path, value: dict[str, Any], ownership_check: Callable[[], None]
+) -> None:
+    ownership_check()
+    root.mkdir(parents=True, exist_ok=True)
+    for stale in root.glob(".status.json.tmp-*"):
+        if stale.is_file():
+            stale.unlink(missing_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=".status.json.tmp-", dir=root)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(_canonical_json(value))
+            stream.flush()
+            os.fsync(stream.fileno())
+        ownership_check()
+        os.replace(temporary, root / "status.json")
+        _fsync_directory(root)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def _append_run(
+    root: Path, value: dict[str, Any], ownership_check: Callable[[], None]
+) -> None:
+    ownership_check()
+    with (root / "runs.jsonl").open("ab") as stream:
+        stream.write(_canonical_json(value))
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _canonical_json(value: object) -> bytes:
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        + "\n"
+    ).encode("utf-8")
+
+
+def _aware_utc(value: datetime) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("Pipeline clock must be timezone-aware")
+    return value.astimezone(UTC)
+
+
+def _existing_ancestor(path: Path) -> Path:
+    candidate = path
+    while not candidate.exists():
+        if candidate.parent == candidate:
+            return Path("/")
+        candidate = candidate.parent
+    return candidate
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+class _RunLog:
+    def __init__(
+        self,
+        root: Path,
+        run_id: str,
+        *,
+        clock: Callable[[], datetime],
+        ownership_check: Callable[[], None],
+    ) -> None:
+        self._clock = clock
+        self._ownership_check = ownership_check
+        started = _aware_utc(clock())
+        directory = root / "logs"
+        ownership_check()
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = started.strftime("%Y%m%dT%H%M%S.%fZ")
+        self._path = directory / f"{stamp}-{os.getpid()}-{run_id[:8]}.log"
+
+    def write(self, message: str) -> None:
+        self._ownership_check()
+        timestamp = _aware_utc(self._clock()).isoformat().replace("+00:00", "Z")
+        with self._path.open("a", encoding="utf-8") as stream:
+            stream.write(f"{timestamp} {message}\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+
+
+def _prune_logs(
+    root: Path, now: datetime, ownership_check: Callable[[], None]
+) -> None:
+    cutoff = _aware_utc(now).timestamp() - 10 * 24 * 60 * 60
+    directory = root / "logs"
+    if not directory.is_dir():
+        return
+    for path in directory.iterdir():
+        if not path.is_file() or path.suffix != ".log":
+            continue
+        try:
+            expired = path.stat().st_mtime < cutoff
+        except OSError:
+            continue
+        if expired:
+            ownership_check()
+            path.unlink(missing_ok=True)
