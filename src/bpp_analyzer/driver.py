@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 import json
 import os
@@ -17,7 +17,11 @@ import uuid
 
 from bpp_analyzer.bundle_source import HourExpired, RawHourIndex, RetryableSourceError
 from bpp_analyzer.fact_store import FactStore, parse_source_day
-from bpp_analyzer.locking import DirectoryLock, LockOwnershipLost
+from bpp_analyzer.locking import (
+    DirectoryLock,
+    LockOwnershipLost,
+    MaximumRunTimeExceeded,
+)
 from bpp_analyzer.object_store import ObjectStore
 from bpp_analyzer.projection import project_hour
 from bpp_analyzer.release import (
@@ -59,6 +63,16 @@ class RunSummary:
         value = asdict(self)
         value["failures"] = list(self.failures)
         return value
+
+
+@dataclass(slots=True)
+class _RunProgress:
+    hours_ingested: int = 0
+    days_sealed: int = 0
+    days_abandoned: int = 0
+    failures: list[dict[str, str]] = field(default_factory=list)
+    changed: bool = False
+    heal_started_monotonic: float | None = None
 
 
 class PipelineDriver:
@@ -140,36 +154,40 @@ class PipelineDriver:
             max_run_seconds=self.max_run_seconds,
         )
         with lock:
+            started_monotonic = time.monotonic()
+            progress = _RunProgress()
+            summary: RunSummary | None = None
+            published_pointer: PublishedPointer | None = None
+            run_log: _RunLog | None = None
+            pending_error: BaseException | None = None
+            pending_traceback = None
             store = FactStore(
                 self.data_root,
                 clock=self.clock,
                 ownership_check=lock.assert_owned,
                 fault_injector=self.fact_fault_injector,
             )
-            publisher = (
-                ReleasePublisher(
+            try:
+                publisher = (
+                    ReleasePublisher(
+                        self.data_root,
+                        self.object_store,
+                        clock=self.clock,
+                        ownership_check=lock.assert_owned,
+                        fault_injector=self.publish_fault_injector,
+                    )
+                    if self.object_store is not None
+                    else None
+                )
+                run_log = _RunLog(
                     self.data_root,
-                    self.object_store,
+                    run_id,
                     clock=self.clock,
                     ownership_check=lock.assert_owned,
-                    fault_injector=self.publish_fault_injector,
                 )
-                if self.object_store is not None
-                else None
-            )
-            run_log = _RunLog(
-                self.data_root,
-                run_id,
-                clock=self.clock,
-                ownership_check=lock.assert_owned,
-            )
-            run_log.write("run started")
-            if lock.stale_run_id is not None:
-                run_log.write(f"stale lock taken over: {lock.stale_run_id}")
-            started_monotonic = time.monotonic()
-            summary: RunSummary | None = None
-            published_pointer: PublishedPointer | None = None
-            try:
+                run_log.write("run started")
+                if lock.stale_run_id is not None:
+                    run_log.write(f"stale lock taken over: {lock.stale_run_id}")
                 summary = self._heal(
                     store,
                     lock,
@@ -177,6 +195,7 @@ class PipelineDriver:
                     now=now,
                     heal_days=heal_days,
                     started_monotonic=started_monotonic,
+                    progress=progress,
                     log=run_log.write,
                 )
                 build_started = time.monotonic()
@@ -254,80 +273,73 @@ class PipelineDriver:
                     },
                     peak_rss_bytes=peak_rss_bytes(),
                 )
+                run_log.write(f"run finished: {summary.outcome}")
             except BaseException as error:
-                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                if isinstance(error, LockOwnershipLost) and not isinstance(
+                    error, MaximumRunTimeExceeded
+                ):
                     raise
-                finished = _aware_utc(self.clock())
-                failure = {
-                    "scope": "run" if summary is None else "release",
-                    "reason": str(getattr(error, "reason", type(error).__name__)),
-                }
-                if summary is None:
-                    summary = _summary(
-                        run_id,
-                        now,
-                        finished,
-                        outcome="error",
-                        exit_code=1,
-                        hours_ingested=0,
-                        days_sealed=0,
-                        days_abandoned=0,
-                        failures=(failure,),
-                        elapsed=time.monotonic() - started_monotonic,
-                    )
-                else:
-                    summary = replace(
+                pending_error = error
+                pending_traceback = error.__traceback__
+                summary = _failed_summary(
+                    summary,
+                    progress,
+                    error,
+                    run_id=run_id,
+                    started_at=now,
+                    started_monotonic=started_monotonic,
+                    finished_at=_aware_utc(self.clock()),
+                )
+                _try_log(run_log, f"run failed: {_error_reason(error)}")
+            finalization_ownership_check = (
+                lock.assert_current_owner
+                if isinstance(pending_error, MaximumRunTimeExceeded)
+                else lock.assert_owned
+            )
+            while True:
+                try:
+                    finalization_ownership_check()
+                    summary, reporting_error = _write_run_reports(
+                        self.data_root,
+                        store,
                         summary,
-                        finished_at=finished.isoformat().replace("+00:00", "Z"),
-                        timings={
-                            **summary.timings,
-                            "total_seconds": round(
-                                max(time.monotonic() - started_monotonic, 0.0), 6
-                            ),
-                        },
-                        outcome="error",
-                        exit_code=1,
-                        failures=summary.failures + (failure,),
-                        peak_rss_bytes=peak_rss_bytes(),
+                        now=_aware_utc(self.clock()),
+                        considered_days=healing_days(now, heal_days),
+                        published_pointer=published_pointer,
+                        ownership_check=finalization_ownership_check,
+                        run_log=run_log,
                     )
-                run_log.write(
-                    f"run failed: {getattr(error, 'reason', type(error).__name__)}"
-                )
-            lock.assert_owned()
-            try:
-                status = build_status(
-                    self.data_root,
-                    store,
-                    summary,
-                    now=_aware_utc(self.clock()),
-                    considered_days=healing_days(now, heal_days),
-                    published_pointer=published_pointer,
-                )
-            except LockOwnershipLost:
-                raise
-            except Exception as error:
-                reason = str(getattr(error, "reason", type(error).__name__))
-                summary = replace(
-                    summary,
-                    finished_at=_aware_utc(self.clock())
-                    .isoformat()
-                    .replace("+00:00", "Z"),
-                    outcome="error",
-                    exit_code=1,
-                    failures=summary.failures
-                    + ({"scope": "status", "reason": reason},),
-                    peak_rss_bytes=peak_rss_bytes(),
-                )
-                run_log.write(f"status collection failed: {reason}")
-                status = _error_status(
-                    self.data_root,
-                    summary,
-                    published_pointer,
-                    now=_aware_utc(self.clock()),
-                )
-            _write_status(self.data_root, status, lock.assert_owned)
-            _append_run(self.data_root, summary.to_dict(), lock.assert_owned)
-            run_log.write(f"run finished: {summary.outcome}")
+                    break
+                except MaximumRunTimeExceeded as error:
+                    if not any(
+                        failure.get("reason") == _error_reason(error)
+                        for failure in summary.failures
+                    ):
+                        summary = _failed_summary(
+                            summary,
+                            progress,
+                            error,
+                            run_id=run_id,
+                            started_at=now,
+                            started_monotonic=started_monotonic,
+                            finished_at=_aware_utc(self.clock()),
+                        )
+                    if pending_error is None:
+                        pending_error = error
+                        pending_traceback = error.__traceback__
+                    finalization_ownership_check = lock.assert_current_owner
+                except LockOwnershipLost:
+                    if pending_error is not None:
+                        raise pending_error.with_traceback(pending_traceback)
+                    raise
+                except BaseException:
+                    if pending_error is not None:
+                        raise pending_error.with_traceback(pending_traceback)
+                    raise
+            if pending_error is not None:
+                raise pending_error.with_traceback(pending_traceback)
+            if reporting_error is not None:
+                raise reporting_error
             return summary
 
     def _heal(
@@ -339,14 +351,11 @@ class PipelineDriver:
         now: datetime,
         heal_days: int,
         started_monotonic: float,
+        progress: _RunProgress,
         log: Callable[[str], None],
     ) -> RunSummary:
-        hours_ingested = 0
-        days_sealed = 0
-        days_abandoned = 0
-        failures: list[dict[str, str]] = []
-        changed = False
         heal_started = time.monotonic()
+        progress.heal_started_monotonic = heal_started
 
         for day in healing_days(now, heal_days):
             lock.assert_owned()
@@ -362,8 +371,8 @@ class PipelineDriver:
                     index = self.source.hour_index(hour)
                     projected = project_hour(index, self.source.stream(index))
                     store.commit_hour(projected)
-                    hours_ingested += 1
-                    changed = True
+                    progress.hours_ingested += 1
+                    progress.changed = True
                 except HourExpired as error:
                     expired_reason = error.reason
                     log(
@@ -372,7 +381,7 @@ class PipelineDriver:
                     )
                     break
                 except RetryableSourceError as error:
-                    failures.append(
+                    progress.failures.append(
                         {
                             "scope": "source_hour",
                             "source_hour": hour.strftime("%Y-%m-%dT%H"),
@@ -391,17 +400,17 @@ class PipelineDriver:
                 remaining = store.missing_hours(day)
                 store.abandon_day(day, remaining, expired_reason)
                 log(f"source day abandoned: {day.isoformat()} ({expired_reason})")
-                days_abandoned += 1
-                changed = True
+                progress.days_abandoned += 1
+                progress.changed = True
                 continue
             try:
                 if not store.missing_hours(day):
                     store.seal_day(day)
                     log(f"source day sealed: {day.isoformat()}")
-                    days_sealed += 1
-                    changed = True
+                    progress.days_sealed += 1
+                    progress.changed = True
             except Exception as error:
-                failures.append(
+                progress.failures.append(
                     {
                         "scope": "source_day",
                         "source_day": day.isoformat(),
@@ -414,17 +423,21 @@ class PipelineDriver:
                 )
 
         finished = _aware_utc(self.clock())
-        outcome = "partial" if failures else "ok" if changed else "noop"
+        outcome = (
+            "partial"
+            if progress.failures
+            else "ok" if progress.changed else "noop"
+        )
         return _summary(
             run_id,
             now,
             finished,
             outcome=outcome,
-            exit_code=4 if failures else 0,
-            hours_ingested=hours_ingested,
-            days_sealed=days_sealed,
-            days_abandoned=days_abandoned,
-            failures=tuple(failures),
+            exit_code=4 if progress.failures else 0,
+            hours_ingested=progress.hours_ingested,
+            days_sealed=progress.days_sealed,
+            days_abandoned=progress.days_abandoned,
+            failures=tuple(progress.failures),
             elapsed=time.monotonic() - started_monotonic,
             heal_seconds=time.monotonic() - heal_started,
         )
@@ -562,6 +575,140 @@ def read_status(data_root: str | Path) -> dict[str, Any]:
 def peak_rss_bytes() -> int:
     observed = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     return observed if sys.platform == "darwin" else observed * 1024
+
+
+def _error_reason(error: BaseException) -> str:
+    reason = getattr(error, "reason", None)
+    if isinstance(reason, str) and reason:
+        return reason
+    message = str(error)
+    return message if message else type(error).__name__
+
+
+def _failed_summary(
+    summary: RunSummary | None,
+    progress: _RunProgress,
+    error: BaseException,
+    *,
+    run_id: str,
+    started_at: datetime,
+    started_monotonic: float,
+    finished_at: datetime,
+) -> RunSummary:
+    failure = {
+        "scope": (
+            "run"
+            if summary is None or isinstance(error, MaximumRunTimeExceeded)
+            else "release"
+        ),
+        "reason": _error_reason(error),
+    }
+    elapsed = time.monotonic() - started_monotonic
+    if summary is None:
+        heal_seconds = (
+            time.monotonic() - progress.heal_started_monotonic
+            if progress.heal_started_monotonic is not None
+            else 0.0
+        )
+        return _summary(
+            run_id,
+            started_at,
+            finished_at,
+            outcome="error",
+            exit_code=1,
+            hours_ingested=progress.hours_ingested,
+            days_sealed=progress.days_sealed,
+            days_abandoned=progress.days_abandoned,
+            failures=tuple(progress.failures) + (failure,),
+            elapsed=elapsed,
+            heal_seconds=heal_seconds,
+        )
+    return replace(
+        summary,
+        finished_at=finished_at.isoformat().replace("+00:00", "Z"),
+        timings={
+            **summary.timings,
+            "total_seconds": round(max(elapsed, 0.0), 6),
+        },
+        outcome="error",
+        exit_code=1,
+        failures=summary.failures + (failure,),
+        peak_rss_bytes=peak_rss_bytes(),
+    )
+
+
+def _try_log(run_log: _RunLog | None, message: str) -> None:
+    if run_log is None:
+        return
+    try:
+        run_log.write(message)
+    except BaseException:
+        pass
+
+
+def _write_run_reports(
+    root: Path,
+    store: FactStore,
+    summary: RunSummary,
+    *,
+    now: datetime,
+    considered_days: tuple[date, ...],
+    published_pointer: PublishedPointer | None,
+    ownership_check: Callable[[], None],
+    run_log: _RunLog | None,
+) -> tuple[RunSummary, BaseException | None]:
+    reporting_error: BaseException | None = None
+    status: dict[str, Any] | None = None
+    try:
+        status = build_status(
+            root,
+            store,
+            summary,
+            now=now,
+            considered_days=considered_days,
+            published_pointer=published_pointer,
+        )
+    except LockOwnershipLost:
+        raise
+    except BaseException as error:
+        reason = _error_reason(error)
+        summary = replace(
+            summary,
+            finished_at=now.isoformat().replace("+00:00", "Z"),
+            outcome="error",
+            exit_code=1,
+            failures=summary.failures + ({"scope": "status", "reason": reason},),
+            peak_rss_bytes=peak_rss_bytes(),
+        )
+        _try_log(run_log, f"status collection failed: {reason}")
+        try:
+            status = _error_status(
+                root,
+                summary,
+                published_pointer,
+                now=now,
+            )
+        except LockOwnershipLost:
+            raise
+        except BaseException as fallback_error:
+            reporting_error = fallback_error
+        if not isinstance(error, Exception) and reporting_error is None:
+            reporting_error = error
+
+    if status is not None:
+        try:
+            _write_status(root, status, ownership_check)
+        except LockOwnershipLost:
+            raise
+        except BaseException as error:
+            reporting_error = reporting_error or error
+    try:
+        _append_run(root, summary.to_dict(), ownership_check)
+    except LockOwnershipLost:
+        raise
+    except BaseException as error:
+        reporting_error = reporting_error or error
+    return summary, reporting_error
 
 
 def _error_status(

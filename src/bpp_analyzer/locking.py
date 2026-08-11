@@ -146,6 +146,17 @@ class DirectoryLock:
             self._mark_lost("Run lock ownership was replaced")
             raise LockOwnershipLost("Run lock ownership was replaced")
 
+    def assert_current_owner(self) -> None:
+        """Fence writes without extending an exceeded run deadline."""
+        if self._lost.is_set() and self._lost_reason != "Maximum run time exceeded":
+            raise LockOwnershipLost(self._lost_reason)
+        if self._started_monotonic is None:
+            raise LockOwnershipLost("Run lock was not acquired")
+        owner = self._read_run_id(self._heartbeat)
+        if owner != self.run_id:
+            self._mark_lost("Run lock ownership was replaced")
+            raise LockOwnershipLost("Run lock ownership was replaced")
+
     def touch(self) -> None:
         self.assert_owned()
         try:
@@ -158,7 +169,7 @@ class DirectoryLock:
         self._stop.set()
         if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(timeout=min(self._interval + 0.1, 1.0))
-        self.assert_owned()
+        self.assert_current_owner()
         try:
             self._heartbeat.unlink()
             self._path.rmdir()
@@ -171,8 +182,17 @@ class DirectoryLock:
     def __enter__(self) -> DirectoryLock:
         return self.acquire()
 
-    def __exit__(self, *_args: object) -> None:
-        self.release()
+    def __exit__(
+        self,
+        _exception_type: object,
+        exception: object,
+        _traceback: object,
+    ) -> None:
+        try:
+            self.release()
+        except LockOwnershipLost:
+            if exception is None:
+                raise
 
     def _heartbeat_loop(self) -> None:
         while not self._stop.wait(self._interval):
