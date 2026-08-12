@@ -401,7 +401,12 @@ class SnapshotBuilder:
                      AND bool_and(c.size IS NOT NULL AND c.size > 0)
                      AND sum(c.size)=10
                      AND bool_and(coalesce(c.socket,c.slot_index) IS NOT NULL
-                                  AND coalesce(c.socket,c.slot_index) >= 0)
+                                  AND coalesce(c.socket,c.slot_index) >= 0
+                                  AND coalesce(c.socket,c.slot_index) + c.size <= 10)
+                     AND bit_or(
+                       ((1::BIGINT << c.size) - 1)
+                       << coalesce(c.socket,c.slot_index)
+                     ) = 1023
                 )
                 SELECT *, victories=10 AND losses >= 0 AS ten_win
                 FROM layouts

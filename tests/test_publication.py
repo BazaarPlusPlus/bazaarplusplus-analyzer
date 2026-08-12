@@ -320,7 +320,15 @@ def _layout_run(
         }
         for number in range(final_count)
     ]
-    observed_slots = slots or tuple(range(len(card_ids)))
+    if slots is None:
+        tiled: list[int] = []
+        cursor = 0
+        for size in sizes:
+            tiled.append(cursor)
+            cursor += size
+        observed_slots: tuple[int, ...] = tuple(tiled)
+    else:
+        observed_slots = slots
     cards = [
         {
             "source_hour": hour,
@@ -365,10 +373,12 @@ def policy_fact_store(tmp_path_factory: pytest.TempPathFactory):
         _layout_run(4, ("not-a-card-id",), (10,)),
         _layout_run(5, valid_ids, (0, 10)),
         _layout_run(6, valid_ids, (4, 5)),
+        _layout_run(7, valid_ids, (5, 5), slots=(0, 3)),
+        _layout_run(8, valid_ids, (5, 5), slots=(2, 5)),
         _layout_run(10, identity, (5, 5), run_day=1, slots=(0, 5), tier="Gold"),
         _layout_run(11, identity, (5, 5), run_day=2, slots=(0, 5), tier="Gold"),
-        _layout_run(12, identity, (5, 5), run_day=3, slots=(1, 6), tier="Diamond"),
-        _layout_run(13, identity, (5, 5), run_day=100, slots=(1, 6), tier="Diamond"),
+        _layout_run(12, identity, (5, 5), run_day=3, slots=(0, 5), tier="Diamond"),
+        _layout_run(13, identity, (5, 5), run_day=100, slots=(0, 5), tier="Diamond"),
         _layout_run(14, identity, (5, 5), victories=8, losses=2, run_day=8),
     )
     for run in rows["runs"]:
@@ -419,11 +429,11 @@ def test_fact_report_counts_each_rejection_reason_without_admitting_the_run(
 
     stats = SnapshotBuilder(root, store=store).fact_stats(window)
 
-    assert stats.raw_runs == 13
+    assert stats.raw_runs == 15
     assert stats.discarded_unknown_hero == 1
     assert stats.discarded_unknown_final_rank == 1
-    assert stats.included_runs == 12
-    assert stats.included_battles == 13
+    assert stats.included_runs == 14
+    assert stats.included_battles == 15
 
 
 def test_representative_layout_mode_tie_break_and_nearest_rank_p75(
@@ -437,7 +447,7 @@ def test_representative_layout_mode_tie_break_and_nearest_rank_p75(
     build = payload["heroes"]["Jules"]["builds"][0]
 
     assert [item[1] for item in build[1]] == [0, 5]
-    assert [item[2] for item in build[1]] == [3, 3]
+    assert [item[2] for item in build[1]] == [4, 4]
     assert build[2] == [5, 4, 8000, 3, wilson_score(4, 5)]
     assert wilson_score(0, 1) == 0
     assert wilson_score(1, 1) == 206543
