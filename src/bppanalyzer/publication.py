@@ -307,9 +307,9 @@ class SnapshotBuilder:
             discarded = _required_row(
                 connection.execute(
                     """
-                SELECT count(*) FILTER (WHERE raw_run),
-                       count(*) FILTER (WHERE discarded_unknown_hero),
-                       count(*) FILTER (WHERE discarded_unknown_final_rank)
+                SELECT count(*) FILTER (WHERE coalesce(raw_run, false)),
+                       count(*) FILTER (WHERE coalesce(discarded_unknown_hero, false)),
+                       count(*) FILTER (WHERE coalesce(discarded_unknown_final_rank, false))
                 FROM quarantine_fact
                 """
                 ).fetchone(),
@@ -382,7 +382,7 @@ class SnapshotBuilder:
                   GROUP BY f.bundle_id, f.run_id, f.source_day, f.hero_norm,
                            f.victories, f.losses, f.run_day, f.final_battle_id
                   HAVING count(*) > 0
-                     AND bool_and(lower(trim(c.card_set_status))='complete')
+                     AND bool_and(lower(trim(coalesce(c.card_set_status,'missing')))<>'missing')
                      AND bool_and(c.template_id IS NOT NULL AND regexp_full_match(
                        lower(c.template_id),
                        '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
@@ -552,7 +552,8 @@ class SnapshotBuilder:
                 explicit = ",".join(_sql_string(str(path)) for path in paths[table])
                 connection.execute(
                     f"CREATE TEMP VIEW {table}_fact AS "
-                    f"SELECT * FROM read_parquet([{explicit}], hive_partitioning=false)"
+                    f"SELECT * FROM read_parquet([{explicit}], hive_partitioning=false, "
+                    f"union_by_name=true)"
                 )
             heroes = ",".join(_sql_string(hero) for hero in CANONICAL_HEROES)
             ranks = ",".join(_sql_string(rank) for rank in sorted(CANONICAL_RANKS))

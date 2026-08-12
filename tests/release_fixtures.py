@@ -122,7 +122,7 @@ def _populated_rows(source_hour: datetime, day_offset: int) -> dict[str, list[di
             "run_id": run_id,
             "battle_id": final_battle_id,
             "card_set_label": "player_hand",
-            "card_set_status": "Complete",
+            "card_set_status": "Captured",
             "owner_side": "player",
             "card_kind": "item",
             "slot_index": index,

@@ -10,6 +10,7 @@ from bppanalyzer.object_store import LocalObjectStore
 from bppanalyzer.publication import (
     BUILDS_KEY,
     HEROES_KEY,
+    AnalysisWindow,
     AnalysisWindowError,
     BuildRank,
     LatestPublisher,
@@ -276,7 +277,7 @@ def _layout_run(
     run_day: int | None = 10,
     slots: tuple[int, ...] | None = None,
     tier: str = "Gold",
-    status: str = "Complete",
+    status: str = "Captured",
     final_count: int = 1,
     final_battle_id: str | None = None,
 ) -> dict[str, list[dict[str, object]]]:
@@ -455,3 +456,82 @@ def test_top_500_then_coverage_appends_only_highest_ranked_uncovered_build() -> 
     assert len(selected) == 501
     containing = [identity for identity in selected if rare in identity]
     assert containing == [(rare,)]
+
+
+def test_fact_report_tolerates_legacy_quarantine_schema(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from bppanalyzer.projection import table_schemas
+
+    root = tmp_path_factory.mktemp("legacy-quarantine-facts")
+    schemas = table_schemas()
+    modern = schemas["quarantine"]
+    legacy_names = [
+        name
+        for name in modern.names
+        if name not in ("raw_run", "discarded_unknown_hero", "discarded_unknown_final_rank")
+    ]
+    legacy = pa.schema([modern.field(name) for name in legacy_names])
+
+    legacy_dir = root / "source_hour=2026-08-07T00"
+    modern_dir = root / "source_hour=2026-08-07T01"
+    for directory in (legacy_dir, modern_dir):
+        directory.mkdir(parents=True)
+        for name in ("runs", "battles"):
+            pq.write_table(
+                pa.Table.from_pylist([], schema=schemas[name]), directory / f"{name}.parquet"
+            )
+    base = {
+        "source_hour": "2026-08-07T00",
+        "source_day": "2026-08-07",
+        "bundle_id": "legacy-bundle",
+        "run_id": "legacy-run",
+        "stage": "bundle_validation",
+        "reason_code": "bundle_missing",
+        "first_seen_at": "2026-08-07T01:00:00Z",
+        "decoder_code_version": "legacy",
+        "diagnostic_json": "{}",
+    }
+    pq.write_table(pa.Table.from_pylist([base], schema=legacy), legacy_dir / "quarantine.parquet")
+    discarded = {
+        **base,
+        "source_hour": "2026-08-07T01",
+        "bundle_id": "modern-bundle",
+        "run_id": "modern-run",
+        "stage": "fact_filter",
+        "reason_code": "unaccepted_run",
+        "raw_run": True,
+        "discarded_unknown_hero": True,
+        "discarded_unknown_final_rank": False,
+    }
+    pq.write_table(
+        pa.Table.from_pylist([discarded], schema=modern), modern_dir / "quarantine.parquet"
+    )
+
+    class _StubStore:
+        def seals(self):
+            return ()
+
+        def hour_paths(self, days):
+            return {
+                name: (legacy_dir / f"{name}.parquet", modern_dir / f"{name}.parquet")
+                for name in ("runs", "battles", "battle_cards", "quality", "quarantine")
+            }
+
+    seal = DaySeal(
+        source_day="2026-08-07",
+        hourly_fact_commits=(),
+        row_counts={},
+        day_seal_sha256="0" * 64,
+    )
+    window = AnalysisWindow(seals=(seal,), start=date(2026, 8, 7), end=date(2026, 8, 7))
+
+    stats = SnapshotBuilder(root, store=_StubStore()).fact_stats(window)
+
+    assert stats.raw_runs == 1
+    assert stats.discarded_unknown_hero == 1
+    assert stats.discarded_unknown_final_rank == 0
+    assert stats.included_runs == 0
