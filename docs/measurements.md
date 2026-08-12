@@ -31,12 +31,47 @@ steady-state (1–2 new settled hours per tick) is minutes per tick.
 Concurrency headroom exists; raising the pool size is the lever if bootstrap
 pace ever matters again.
 
-## Still open (to be filled as observed)
+## Hourly Parquet size ⇒ `facts/` footprint — measured
 
-- Hourly Parquet size ⇒ steady-state `facts/` footprint.
-- Wall clock + peak RSS of a real 7-day build.
-- Tolerated download concurrency (current conservative setting untested
-  upward).
-- Release payload sizes under the new contract (chiefly
-  `window/heroes.json`).
-- Offsite backup decision for `facts/`.
+Busy daytime hours: ~2,400 bundles ⇒ ~17–22 MiB of Parquet per hour
+(battle_cards dominates at ~18 MiB). Five sealed days (120 hours) occupy
+~1.9 GiB. Steady state grows ≈ 0.3–0.5 GiB/day of never-pruned history;
+a year is roughly 120–180 GiB.
+
+## Real release build wall clock + peak RSS — measured
+
+First real build (5-day window, 2.79 M battles, 13.8 k submitters): **4 s
+wall clock**, ~0.9 GiB peak build-phase RSS after the builds-payload memory
+fix (pre-fix the build OOMed the 8 GB DuckDB limit). Projected 7-day peak
+< 2 GiB — comfortably inside the 8 GB contract.
+
+## Tolerated download concurrency — measured
+
+The workload is latency-bound (CPU < 1%, per-request round trip ≈ 3 s on the
+operator's network path): 4 → 8 concurrent downloads scaled near-linearly
+(~5.5 → ~2.5 min per busy hour). Above ~20, the default httpx keepalive pool
+was the hidden cap (fixed: pool now sized to the concurrency). Concurrency 64
+produced no server-side pushback (no load-attributable 429/5xx); daytime
+congestion on the operator's path, not the server, set the effective floor.
+Bootstrap settings: `BPP_DOWNLOAD_CONCURRENCY=64`, `BPP_DOWNLOAD_LOOKAHEAD=128`.
+
+## Release payload sizes — measured
+
+Whole release (5-day window): **1.0 MiB** total; `window/heroes.json`
+(3 segments × 8 heroes, full matchup matrix and rank arrays) and
+`window/builds.json` (4,600 builds, 1,026-card index) are each a few hundred
+KiB. Size is a non-issue; no compact-encoding pressure on `heroes.json`.
+
+## Ingest peak RSS — measured; fix in progress
+
+Multi-hour heal runs peaked at ~5 GiB RSS with the original whole-hour
+Python-dict projection (busy hours materialize millions of battle_cards rows
+before a single Parquet write), violating acceptance #5's 1 GiB/hour bound on
+real data even though the synthetic-fixture test passed. Remediation:
+projection is being converted to stream bounded row batches through
+`pyarrow.parquet.ParquetWriter`.
+
+## Still open
+
+- Offsite backup decision for `facts/` (rclone-to-R2 after each run remains
+  the candidate; must be decided, not defaulted).
