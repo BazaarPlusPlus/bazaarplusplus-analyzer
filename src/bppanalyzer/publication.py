@@ -304,12 +304,23 @@ class SnapshotBuilder:
                 ).fetchone(),
                 "Run counts",
             )
+            quarantine_columns = {
+                row[0] for row in connection.execute("DESCRIBE quarantine_fact").fetchall()
+            }
+
+            def _flag(column: str) -> str:
+                # Fact hours written before the quarantine schema gained the
+                # discard flags lack these columns entirely.
+                return column if column in quarantine_columns else "false"
+
             discarded = _required_row(
                 connection.execute(
-                    """
-                SELECT count(*) FILTER (WHERE coalesce(raw_run, false)),
-                       count(*) FILTER (WHERE coalesce(discarded_unknown_hero, false)),
-                       count(*) FILTER (WHERE coalesce(discarded_unknown_final_rank, false))
+                    f"""
+                SELECT count(*) FILTER (WHERE coalesce({_flag("raw_run")}, false)),
+                       count(*) FILTER (WHERE coalesce({_flag("discarded_unknown_hero")}, false)),
+                       count(*) FILTER (
+                         WHERE coalesce({_flag("discarded_unknown_final_rank")}, false)
+                       )
                 FROM quarantine_fact
                 """
                 ).fetchone(),

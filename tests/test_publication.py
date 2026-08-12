@@ -458,8 +458,10 @@ def test_top_500_then_coverage_appends_only_highest_ranked_uncovered_build() -> 
     assert containing == [(rare,)]
 
 
+@pytest.mark.parametrize("include_modern_hour", (True, False))
 def test_fact_report_tolerates_legacy_quarantine_schema(
     tmp_path_factory: pytest.TempPathFactory,
+    include_modern_hour: bool,
 ) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -507,9 +509,12 @@ def test_fact_report_tolerates_legacy_quarantine_schema(
         "discarded_unknown_hero": True,
         "discarded_unknown_final_rank": False,
     }
-    pq.write_table(
-        pa.Table.from_pylist([discarded], schema=modern), modern_dir / "quarantine.parquet"
+    second_hour = (
+        pa.Table.from_pylist([discarded], schema=modern)
+        if include_modern_hour
+        else pa.Table.from_pylist([base], schema=legacy)
     )
+    pq.write_table(second_hour, modern_dir / "quarantine.parquet")
 
     class _StubStore:
         def seals(self):
@@ -531,7 +536,8 @@ def test_fact_report_tolerates_legacy_quarantine_schema(
 
     stats = SnapshotBuilder(root, store=_StubStore()).fact_stats(window)
 
-    assert stats.raw_runs == 1
-    assert stats.discarded_unknown_hero == 1
+    expected = 1 if include_modern_hour else 0
+    assert stats.raw_runs == expected
+    assert stats.discarded_unknown_hero == expected
     assert stats.discarded_unknown_final_rank == 0
     assert stats.included_runs == 0
