@@ -1,13 +1,13 @@
 """Single-machine mkdir lock with stale takeover and zombie fencing."""
 
-from datetime import UTC, datetime
 import json
 import os
-from pathlib import Path
 import shutil
 import socket
 import threading
 import time
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Callable, Self
 
 
@@ -229,7 +229,7 @@ class DirectoryLock:
     def _read_run_id(path: Path) -> str | None:
         try:
             value = json.loads(path.read_bytes())
-        except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError):
+        except FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError:
             return None
         run_id = value.get("run_id") if isinstance(value, dict) else None
         return run_id if isinstance(run_id, str) else None

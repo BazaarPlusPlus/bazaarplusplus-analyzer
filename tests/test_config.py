@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from bpp_analyzer.config import ConfigurationError, load_config
+from bppanalyzer.config import ConfigurationError, load_config
 
 
 def _write_env(root: Path, extra: str = "") -> None:

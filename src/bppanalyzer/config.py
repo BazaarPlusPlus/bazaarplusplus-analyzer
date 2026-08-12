@@ -1,8 +1,8 @@
 """Strict repository ``.env`` configuration without ambient-env fallback."""
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-import re
 
 from dotenv import dotenv_values
 
@@ -79,12 +79,8 @@ def load_config(
             values.get("BPP_MAX_RUN_SECONDS"), 7200, "BPP_MAX_RUN_SECONDS"
         ),
         duckdb_memory_limit=_memory_limit(values.get("BPP_DUCKDB_MEMORY_LIMIT")),
-        duckdb_threads=_positive_int(
-            values.get("BPP_DUCKDB_THREADS"), 8, "BPP_DUCKDB_THREADS"
-        ),
-        keep_releases=_positive_int(
-            values.get("BPP_KEEP_RELEASES"), 3, "BPP_KEEP_RELEASES"
-        ),
+        duckdb_threads=_positive_int(values.get("BPP_DUCKDB_THREADS"), 8, "BPP_DUCKDB_THREADS"),
+        keep_releases=_positive_int(values.get("BPP_KEEP_RELEASES"), 3, "BPP_KEEP_RELEASES"),
         r2_account_id=r2_account_id,
         r2_bucket=r2_bucket,
         r2_access_key_id=r2_access_key_id,
@@ -113,11 +109,7 @@ def _memory_limit(value: object) -> str:
         return "8GB"
     parsed = str(value).strip().upper()
     if re.fullmatch(r"\d+(?:\.\d+)?(?:KB|MB|GB|TB)", parsed) is None:
-        raise ConfigurationError(
-            "BPP_DUCKDB_MEMORY_LIMIT must be a positive size such as 8GB"
-        )
+        raise ConfigurationError("BPP_DUCKDB_MEMORY_LIMIT must be a positive size such as 8GB")
     if float(parsed[:-2]) <= 0:
-        raise ConfigurationError(
-            "BPP_DUCKDB_MEMORY_LIMIT must be a positive size such as 8GB"
-        )
+        raise ConfigurationError("BPP_DUCKDB_MEMORY_LIMIT must be a positive size such as 8GB")
     return parsed

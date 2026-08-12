@@ -1,39 +1,38 @@
 """Oldest-first heal/seal convergence and local health reporting."""
 
-from dataclasses import asdict, dataclass, field, replace
-from datetime import UTC, date, datetime, timedelta
 import json
 import os
-from pathlib import Path
 import resource
 import shutil
 import sys
 import tempfile
 import time
-from typing import Any, Callable, Protocol
 import uuid
+from dataclasses import asdict, dataclass, field, replace
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
+from typing import Any, Callable, Protocol
 
-from bpp_analyzer.bundle_source import HourExpired, RawHourIndex, RetryableSourceError
-from bpp_analyzer.fact_store import FactStore, parse_source_day
-from bpp_analyzer.locking import (
+from bppanalyzer.bundle_source import HourExpired, RawHourIndex, RetryableSourceError
+from bppanalyzer.fact_store import FactStore, parse_source_day
+from bppanalyzer.locking import (
     DirectoryLock,
     LockOwnershipLost,
     MaximumRunTimeExceeded,
 )
-from bpp_analyzer.object_store import ObjectStore
-from bpp_analyzer.projection import project_hour
-from bpp_analyzer.release import (
+from bppanalyzer.object_store import ObjectStore
+from bppanalyzer.projection import project_hour
+from bppanalyzer.release import (
     EPOCH_DAY,
+    RELEASE_ID_PATTERN,
     InvalidPointer,
     PublishedPointer,
-    RELEASE_ID_PATTERN,
     ReleaseBuilder,
     ReleasePublisher,
     compute_release_id,
     local_newest_release_id,
     window_seals,
 )
-
 
 DEFAULT_HEAL_DAYS = 8
 DEFAULT_SETTLE_LAG = timedelta(seconds=60)
@@ -104,7 +103,11 @@ class PipelineDriver:
     ) -> None:
         if settle_lag <= timedelta():
             raise ValueError("Settle lag must be positive")
-        if not isinstance(keep_releases, int) or isinstance(keep_releases, bool) or keep_releases < 1:
+        if (
+            not isinstance(keep_releases, int)
+            or isinstance(keep_releases, bool)
+            or keep_releases < 1
+        ):
             raise ValueError("keep_releases must be a positive integer")
         self.data_root = Path(data_root)
         self.source = source
@@ -138,9 +141,7 @@ class PipelineDriver:
         run_id = uuid.uuid4().hex
         if dry_run:
             if self.object_store is not None:
-                ReleasePublisher(
-                    self.data_root, self.object_store
-                ).current_pointer()
+                ReleasePublisher(self.data_root, self.object_store).current_pointer()
             return _summary(
                 run_id,
                 now,
@@ -197,6 +198,7 @@ class PipelineDriver:
                 run_log.write("run started")
                 if lock.stale_run_id is not None:
                     run_log.write(f"stale lock taken over: {lock.stale_run_id}")
+
                 def report(message: str) -> None:
                     run_log.write(message)
                     if progress_callback is not None:
@@ -320,12 +322,9 @@ class PipelineDriver:
                             f"elapsed={_format_elapsed(time.monotonic() - pointer_started)} "
                             f"pointer_state={pointer_state}"
                         )
-                    if (
-                        publish_candidate
-                        and (
-                            published_pointer is None
-                            or local.release_id != published_pointer.release_id
-                        )
+                    if publish_candidate and (
+                        published_pointer is None
+                        or local.release_id != published_pointer.release_id
                     ):
                         publish_action_started = time.monotonic()
                         checkpoint("publish", None, step="upload")
@@ -349,17 +348,11 @@ class PipelineDriver:
                     elif local is None:
                         report("publish skipped: no local release")
                     elif not publish:
-                        report(
-                            f"publish skipped: release_id={local.release_id} --no-publish"
-                        )
+                        report(f"publish skipped: release_id={local.release_id} --no-publish")
                     elif hold:
-                        report(
-                            f"publish skipped: release_id={local.release_id} hold active"
-                        )
+                        report(f"publish skipped: release_id={local.release_id} hold active")
                     else:
-                        report(
-                            f"publish skipped: release_id={local.release_id} already published"
-                        )
+                        report(f"publish skipped: release_id={local.release_id} already published")
                 publish_seconds = time.monotonic() - publish_started
                 if summary.exit_code == 0:
                     _prune_releases(
@@ -376,15 +369,9 @@ class PipelineDriver:
                     finished_at=_aware_utc(self.clock()).isoformat().replace("+00:00", "Z"),
                     timings={
                         **summary.timings,
-                        "total_seconds": round(
-                            max(time.monotonic() - started_monotonic, 0.0), 6
-                        ),
-                        "build_seconds": round(
-                            max(build_seconds, 0.0), 6
-                        ),
-                        "publish_seconds": round(
-                            max(publish_seconds, 0.0), 6
-                        ),
+                        "total_seconds": round(max(time.monotonic() - started_monotonic, 0.0), 6),
+                        "build_seconds": round(max(build_seconds, 0.0), 6),
+                        "publish_seconds": round(max(publish_seconds, 0.0), 6),
                     },
                     peak_rss_bytes=peak_rss_bytes(),
                 )
@@ -489,10 +476,7 @@ class PipelineDriver:
             )
         hours_planned = sum(len(hours) for hours in planned_by_day.values())
         progress.hours_planned = hours_planned
-        report(
-            f"heal plan: days={len(days)} "
-            f"missing_settled_hours={hours_planned}"
-        )
+        report(f"heal plan: days={len(days)} missing_settled_hours={hours_planned}")
 
         hours_started = 0
         for day, planned_hours in planned_by_day.items():
@@ -506,8 +490,7 @@ class PipelineDriver:
                     hour_started = time.monotonic()
                     hour_key = hour.strftime("%Y-%m-%dT%H")
                     report(
-                        f"hour started: source_hour={hour_key} "
-                        f"[{hours_started}/{hours_planned}]"
+                        f"hour started: source_hour={hour_key} [{hours_started}/{hours_planned}]"
                     )
                     checkpoint("heal", hour_key, step="index")
                     index_started = time.monotonic()
@@ -518,8 +501,7 @@ class PipelineDriver:
                         f"elapsed={_format_elapsed(time.monotonic() - index_started)}"
                     )
                     report(
-                        f"hour ingest started: source_hour={hour_key} "
-                        f"bundles={len(index.items)}"
+                        f"hour ingest started: source_hour={hour_key} bundles={len(index.items)}"
                     )
                     checkpoint(
                         "heal",
@@ -531,9 +513,7 @@ class PipelineDriver:
                     ingest_started = time.monotonic()
 
                     def observed_bundles():
-                        for completed, bundle in enumerate(
-                            self.source.stream(index), start=1
-                        ):
+                        for completed, bundle in enumerate(self.source.stream(index), start=1):
                             yield bundle
                             if (
                                 completed == 1
@@ -575,8 +555,7 @@ class PipelineDriver:
                 except HourExpired as error:
                     expired_reason = error.reason
                     report_error(
-                        f"source hour expired: {hour.strftime('%Y-%m-%dT%H')} "
-                        f"({error.reason})"
+                        f"source hour expired: {hour.strftime('%Y-%m-%dT%H')} ({error.reason})"
                     )
                     break
                 except RetryableSourceError as error:
@@ -640,11 +619,7 @@ class PipelineDriver:
                 )
 
         finished = _aware_utc(self.clock())
-        outcome = (
-            "partial"
-            if progress.failures
-            else "ok" if progress.changed else "noop"
-        )
+        outcome = "partial" if progress.failures else "ok" if progress.changed else "noop"
         return _summary(
             run_id,
             now,
@@ -715,12 +690,8 @@ def build_status(
     seals = store.seals()
     abandoned = store.abandoned_days()
     if considered_days is None:
-        candidate_days = {
-            date.fromisoformat(value[:10]) for value in store.committed_hours()
-        }
-        candidate_days.update(
-            date.fromisoformat(item.source_day) for item in abandoned
-        )
+        candidate_days = {date.fromisoformat(value[:10]) for value in store.committed_hours()}
+        candidate_days.update(date.fromisoformat(item.source_day) for item in abandoned)
         considered_days = tuple(sorted(candidate_days))
     incomplete = []
     sealed_days = {item.source_day for item in seals}
@@ -735,8 +706,7 @@ def build_status(
                     "source_day": day.isoformat(),
                     "missing_hours": [hour.strftime("%Y-%m-%dT%H") for hour in missing],
                     "settled": is_hour_settled(
-                        datetime.combine(day, datetime.min.time(), UTC)
-                        + timedelta(hours=23),
+                        datetime.combine(day, datetime.min.time(), UTC) + timedelta(hours=23),
                         now,
                     ),
                 }
@@ -749,9 +719,7 @@ def build_status(
         else None
     )
     observed_pointer_state = pointer_state or (
-        POINTER_STATE_OK
-        if published_pointer is not None
-        else POINTER_STATE_ABSENT
+        POINTER_STATE_OK if published_pointer is not None else POINTER_STATE_ABSENT
     )
     return {
         "facts": {
@@ -834,7 +802,7 @@ def _write_current_status(
         observed = json.loads((root / "status.json").read_bytes())
         if isinstance(observed, dict):
             previous = observed
-    except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError):
+    except FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError:
         pass
 
     status = build_status(
@@ -859,7 +827,7 @@ def _write_current_status(
             "published_manifest_age_seconds",
         ):
             status["release"][field] = previous["release"].get(field)
-    status["current_run"] = {
+    current_run: dict[str, Any] = {
         "run_id": run_id,
         "phase": phase,
         "step": step,
@@ -870,10 +838,11 @@ def _write_current_status(
         "updated_at": _aware_utc(now).isoformat().replace("+00:00", "Z"),
     }
     if bundles_total is not None:
-        status["current_run"]["bundles"] = {
+        current_run["bundles"] = {
             "done": bundles_done or 0,
             "total": bundles_total,
         }
+    status["current_run"] = current_run
     _write_status(root, status, ownership_check)
 
 
@@ -897,9 +866,7 @@ def _failed_summary(
 ) -> RunSummary:
     failure = {
         "scope": (
-            "run"
-            if summary is None or isinstance(error, MaximumRunTimeExceeded)
-            else "release"
+            "run" if summary is None or isinstance(error, MaximumRunTimeExceeded) else "release"
         ),
         "reason": _error_reason(error),
     }
@@ -1040,11 +1007,8 @@ def _error_status(
         "release": {
             "publish_hold": (root / "publish-hold.json").is_file(),
             "local_newest_release_id": local_newest_release_id(root),
-            "pointer_state": pointer_state or (
-                POINTER_STATE_OK
-                if published_pointer is not None
-                else POINTER_STATE_ABSENT
-            ),
+            "pointer_state": pointer_state
+            or (POINTER_STATE_OK if published_pointer is not None else POINTER_STATE_ABSENT),
             "published_release_id": (
                 published_pointer.release_id if published_pointer is not None else None
             ),
@@ -1094,9 +1058,7 @@ def _summary(
     )
 
 
-def _write_status(
-    root: Path, value: dict[str, Any], ownership_check: Callable[[], None]
-) -> None:
+def _write_status(root: Path, value: dict[str, Any], ownership_check: Callable[[], None]) -> None:
     ownership_check()
     root.mkdir(parents=True, exist_ok=True)
     for stale in root.glob(".status.json.tmp-*"):
@@ -1119,9 +1081,7 @@ def _write_status(
         temporary.unlink(missing_ok=True)
 
 
-def _append_run(
-    root: Path, value: dict[str, Any], ownership_check: Callable[[], None]
-) -> None:
+def _append_run(root: Path, value: dict[str, Any], ownership_check: Callable[[], None]) -> None:
     ownership_check()
     with (root / "runs.jsonl").open("ab") as stream:
         stream.write(_canonical_json(value))
@@ -1131,8 +1091,7 @@ def _append_run(
 
 def _canonical_json(value: object) -> bytes:
     return (
-        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        + "\n"
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
     ).encode("utf-8")
 
 
@@ -1210,7 +1169,7 @@ def _prune_releases(
     hold_path = root / "publish-hold.json"
     try:
         hold = json.loads(hold_path.read_bytes())
-    except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError):
+    except FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError:
         hold = None
     if isinstance(hold, dict):
         target = hold.get("target_release_id")
@@ -1227,9 +1186,7 @@ def _prune_releases(
         _fsync_directory(releases)
 
 
-def _prune_logs(
-    root: Path, now: datetime, ownership_check: Callable[[], None]
-) -> None:
+def _prune_logs(root: Path, now: datetime, ownership_check: Callable[[], None]) -> None:
     cutoff = _aware_utc(now).timestamp() - 10 * 24 * 60 * 60
     directory = root / "logs"
     if not directory.is_dir():

@@ -37,11 +37,13 @@ writing code:
 
 ## Engineering conventions
 
-- Python 3.13, package `bpp_analyzer`, distribution `bpp-analyzer`, CLI entry
-  point `bpp`. A `.venv` with dependencies is pre-installed at the repo root;
-  run everything through it (`.venv/bin/python`, `.venv/bin/pytest`,
-  `.venv/bin/bpp`). If a new dependency is needed, add it to `pyproject.toml`
-  and note it in the report — the dispatcher installs it.
+- Python 3.14, package `bppanalyzer`, distribution `bazaarplusplus-analyzer`, CLI entry
+  point `bpp`. Restore the pinned environment with `uv sync --all-groups` and run
+  project commands through `uv run`. Install the repository hooks with
+  `uv run pre-commit install`; commits run Ruff lint/format and ty, while pushes
+  run the full pytest suite with branch coverage. The explicit local quality gates
+  are `uv run ruff check .`, `uv run ruff format --check .`, `uv run ty check`,
+  and `uv run pytest -q`.
 - Deep-module style: behavior concentrates in the four module interfaces from
   the spec's Modules section (`bundle_source`, `fact_store`, `release`,
   `driver`); everything else is thin glue.

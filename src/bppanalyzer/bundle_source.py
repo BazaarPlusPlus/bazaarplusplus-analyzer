@@ -1,18 +1,17 @@
 """Bounded, in-memory access to immutable Bundle Server Source Hours."""
 
-from collections.abc import Callable, Iterator, Mapping
-from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 import re
 import threading
 import time
+from collections.abc import Callable, Iterator, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any, Self, TypeVar
 
 import httpx
-
 
 BUNDLE_MAGIC = b"BPPBNDL5"
 BUNDLE_VERSION = 5
@@ -78,9 +77,7 @@ class BundleRef:
         if self.sha256 is not None and _SHA256.fullmatch(self.sha256) is None:
             raise ValueError("Bundle reference sha256 is invalid")
         if self.bytes is not None and (
-            not isinstance(self.bytes, int)
-            or isinstance(self.bytes, bool)
-            or self.bytes < 0
+            not isinstance(self.bytes, int) or isinstance(self.bytes, bool) or self.bytes < 0
         ):
             raise ValueError("Bundle reference byte count is invalid")
 
@@ -187,9 +184,7 @@ class BundleSource:
                 raise SourceContractError(
                     "source_response_invalid", "Bundle collection response is not JSON"
                 ) from error
-            page_items, next_cursor = self._parse_page(
-                payload, start_ms=start_ms, end_ms=end_ms
-            )
+            page_items, next_cursor = self._parse_page(payload, start_ms=start_ms, end_ms=end_ms)
             pages += 1
             if not page_items and next_cursor is not None:
                 raise SourceContractError(
@@ -227,9 +222,7 @@ class BundleSource:
 
         items = tuple(sorted(by_id.values(), key=lambda item: item.cursor))
         if not items and self._is_past_retention(hour):
-            raise HourExpired(
-                "source_hour_expired", "An empty Source Hour is past retention"
-            )
+            raise HourExpired("source_hour_expired", "An empty Source Hour is past retention")
         return RawHourIndex(
             source_hour=hour,
             items=items,
@@ -287,11 +280,9 @@ class BundleSource:
         except DownloadUrlExpired:
             with self._refresh_lock:
                 refreshed = self.hour_index(index.source_hour)
-            if (
-                refreshed.raw_commit_sha256 != index.raw_commit_sha256
-                or [_stable_ref(value) for value in refreshed.items]
-                != [_stable_ref(value) for value in index.items]
-            ):
+            if refreshed.raw_commit_sha256 != index.raw_commit_sha256 or [
+                _stable_ref(value) for value in refreshed.items
+            ] != [_stable_ref(value) for value in index.items]:
                 raise SourceContractError(
                     "source_window_changed",
                     "Bundle identities changed while refreshing a download URL",
@@ -335,9 +326,7 @@ class BundleSource:
                 else:
                     code, body_retryable = None, False
                 if response.status_code == 410 and code == "window_expired":
-                    raise HourExpired(
-                        code, "The Bundle Server no longer retains this hour"
-                    )
+                    raise HourExpired(code, "The Bundle Server no longer retains this hour")
                 if response.status_code == 403:
                     raise DownloadUrlExpired(
                         "download_url_expired", "Bundle download capability expired"
@@ -424,8 +413,7 @@ class BundleSource:
         window = _mapping(root.get("window"), "window")
         if (
             _integer(window.get("available_from_ms"), "available_from_ms") != start_ms
-            or _integer(window.get("available_before_ms"), "available_before_ms")
-            != end_ms
+            or _integer(window.get("available_before_ms"), "available_before_ms") != end_ms
         ):
             raise SourceContractError(
                 "source_window_mismatch", "Bundle response changed the fixed window"
@@ -441,9 +429,7 @@ class BundleSource:
             bundle_id = value.get("bundle_id")
             download_url = value.get("download_url")
             if not isinstance(bundle_id, str) or not bundle_id:
-                raise SourceContractError(
-                    "source_response_invalid", "Bundle item ID is invalid"
-                )
+                raise SourceContractError("source_response_invalid", "Bundle item ID is invalid")
             if not isinstance(download_url, str) or not download_url:
                 raise SourceContractError(
                     "source_response_invalid", "Bundle download URL is invalid"
@@ -481,9 +467,7 @@ class BundleSource:
             value = _mapping(raw_next, "next_after")
             bundle_id = value.get("bundle_id")
             if not isinstance(bundle_id, str) or not bundle_id:
-                raise SourceContractError(
-                    "source_response_invalid", "Bundle cursor ID is invalid"
-                )
+                raise SourceContractError("source_response_invalid", "Bundle cursor ID is invalid")
             next_cursor = (
                 _integer(value.get("available_at_ms"), "available_at_ms"),
                 bundle_id,
@@ -520,14 +504,10 @@ def validate_bundle(content: bytes, *, expected_bundle_id: str) -> Mapping[str, 
     if len(content) < 16 or content[:8] != BUNDLE_MAGIC:
         raise SourceContractError("invalid_prefix", "Bundle magic is invalid")
     if int.from_bytes(content[8:12], "big") != BUNDLE_VERSION:
-        raise SourceContractError(
-            "unsupported_bundle_version", "Bundle version is unsupported"
-        )
+        raise SourceContractError("unsupported_bundle_version", "Bundle version is unsupported")
     manifest_length = int.from_bytes(content[12:16], "big")
     if not 1 <= manifest_length <= MAX_MANIFEST_BYTES:
-        raise SourceContractError(
-            "manifest_too_large", "Bundle manifest length is invalid"
-        )
+        raise SourceContractError("manifest_too_large", "Bundle manifest length is invalid")
     payload_start = 16 + manifest_length
     if payload_start >= len(content):
         raise SourceContractError("run_missing", "Bundle Run segment is missing")
@@ -548,17 +528,13 @@ def validate_bundle(content: bytes, *, expected_bundle_id: str) -> Mapping[str, 
     run = _mapping(manifest.get("run"), "run")
     if run.get("run_format_version") != BUNDLE_VERSION:
         raise SourceContractError("unsupported_run_format", "Run format is unsupported")
-    if not isinstance(run.get("run_id"), str) or not isinstance(
-        run.get("player_account_id"), str
-    ):
+    if not isinstance(run.get("run_id"), str) or not isinstance(run.get("player_account_id"), str):
         raise SourceContractError("manifest_schema_invalid", "Run identities are invalid")
     projection = _mapping(run.get("projection"), "run.projection")
     _mapping(projection.get("run"), "run.projection.run")
     projected_battles = projection.get("battles")
     if not isinstance(projected_battles, list):
-        raise SourceContractError(
-            "manifest_schema_invalid", "Run Battle projection is invalid"
-        )
+        raise SourceContractError("manifest_schema_invalid", "Run Battle projection is invalid")
     payload = _mapping(run.get("payload"), "run.payload")
     run_offset = _integer(payload.get("offset"), "run.payload.offset")
     run_length = _integer(payload.get("length"), "run.payload.length")
@@ -584,29 +560,19 @@ def validate_bundle(content: bytes, *, expected_bundle_id: str) -> Mapping[str, 
             reason = "segment_overlap" if offset < run_length else "segment_out_of_bounds"
             raise SourceContractError(reason, "Screenshot must immediately follow the Run")
         if not 1 <= screenshot_length <= MAX_SCREENSHOT_BYTES:
-            raise SourceContractError(
-                "screenshot_too_large", "Screenshot length is invalid"
-            )
-        if not isinstance(screenshot_digest, str) or _SHA256.fullmatch(
-            screenshot_digest
-        ) is None:
-            raise SourceContractError(
-                "manifest_schema_invalid", "Screenshot digest is invalid"
-            )
+            raise SourceContractError("screenshot_too_large", "Screenshot length is invalid")
+        if not isinstance(screenshot_digest, str) or _SHA256.fullmatch(screenshot_digest) is None:
+            raise SourceContractError("manifest_schema_invalid", "Screenshot digest is invalid")
 
     described_end = payload_start + run_length + screenshot_length
     if described_end != len(content):
         reason = (
-            "undeclared_trailing_bytes"
-            if described_end < len(content)
-            else "segment_out_of_bounds"
+            "undeclared_trailing_bytes" if described_end < len(content) else "segment_out_of_bounds"
         )
         raise SourceContractError(reason, "Bundle segment layout is invalid")
     run_bytes = content[payload_start : payload_start + run_length]
     if hashlib.sha256(run_bytes).hexdigest() != run_digest:
-        raise SourceContractError(
-            "segment_digest_mismatch", "Run segment digest does not match"
-        )
+        raise SourceContractError("segment_digest_mismatch", "Run segment digest does not match")
     if screenshot_digest is not None:
         screenshot_bytes = content[payload_start + run_length : described_end]
         if hashlib.sha256(screenshot_bytes).hexdigest() != screenshot_digest:
@@ -658,8 +624,7 @@ def _identity(item: BundleRef) -> dict[str, object]:
 
 def _canonical_json(value: object) -> bytes:
     return (
-        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        + "\n"
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
     ).encode("utf-8")
 
 
@@ -677,9 +642,7 @@ def _response_error_details(response: httpx.Response) -> tuple[str | None, bool]
 
 def _mapping(value: object, field: str) -> Mapping[str, Any]:
     if not isinstance(value, dict):
-        raise SourceContractError(
-            "source_response_invalid", f"{field} must be an object"
-        )
+        raise SourceContractError("source_response_invalid", f"{field} must be an object")
     return value
 
 

@@ -1,17 +1,17 @@
-from datetime import UTC, datetime
 import hashlib
+from datetime import UTC, datetime
 
 import httpx
 import pytest
 
-from bpp_analyzer.bundle_source import (
+from bppanalyzer.bundle_source import (
     Bundle,
     BundleRef,
     BundleSource,
     RawHourIndex,
     raw_commit_sha256,
 )
-from bpp_analyzer.projection import project_hour
+from bppanalyzer.projection import project_hour
 from tests.bundle_fixtures import SOURCE_HOUR, bundle_bytes, payload
 
 
@@ -86,12 +86,16 @@ def test_battle_outcome_falls_back_to_participant_account_ids(
     winner_side: str,
     winner_hero: str,
 ) -> None:
-    battle = _project_payload(
-        payload(
-            winner_combatant_id=winner_id,
-            loser_combatant_id=loser_id,
+    battle = (
+        _project_payload(
+            payload(
+                winner_combatant_id=winner_id,
+                loser_combatant_id=loser_id,
+            )
         )
-    ).tables["battles"].to_pylist()[0]
+        .tables["battles"]
+        .to_pylist()[0]
+    )
 
     assert battle["winner_side"] == winner_side
     assert battle["winner_hero"] == winner_hero
@@ -112,8 +116,9 @@ def test_battle_outcome_keeps_an_unknown_combatant_undecided() -> None:
     assert run["battle_decided_count"] == 0
 
 
-def test_bundle_digest_magic_and_segment_failures_are_quarantined_without_dropping_valid_data(
-) -> None:
+def test_bundle_digest_magic_and_segment_failures_are_quarantined_without_dropping_valid_data() -> (
+    None
+):
     valid = bundle_bytes("bundle-a")
     wrong_declared_digest = bundle_bytes("bundle-b")
     corrupt_magic = b"NOTBNDL5" + bundle_bytes("bundle-c")[8:]

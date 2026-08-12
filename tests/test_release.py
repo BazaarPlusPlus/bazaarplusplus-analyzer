@@ -1,14 +1,14 @@
-from dataclasses import replace
-from datetime import date, timedelta
 import hashlib
 import json
+from dataclasses import replace
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
 
-import bpp_analyzer.release as release_module
-from bpp_analyzer.fact_store import DaySeal, canonical_json
-from bpp_analyzer.release import (
+import bppanalyzer.release as release_module
+from bppanalyzer.fact_store import DaySeal, canonical_json
+from bppanalyzer.release import (
     ContractViolation,
     ManifestMismatch,
     ReleaseBuilder,
@@ -33,10 +33,7 @@ class _SyntheticSpillStore:
 
 
 def _spill_stress_store(root: Path, *, non_final_battles: int) -> _SyntheticSpillStore:
-    paths = {
-        name: root / f"{name}.parquet"
-        for name in ("runs", "battles", "battle_cards")
-    }
+    paths = {name: root / f"{name}.parquet" for name in ("runs", "battles", "battle_cards")}
     connection = release_module.duckdb.connect(database=":memory:")
     try:
         connection.execute(
@@ -57,7 +54,7 @@ def _spill_stress_store(root: Path, *, non_final_battles: int) -> _SyntheticSpil
                      1300::BIGINT AS final_rating,
                      10::BIGINT AS final_rating_delta,
                      'battle-00000000' AS final_battle_id
-            ) TO {release_module._sql_string(str(paths['runs']))}
+            ) TO {release_module._sql_string(str(paths["runs"]))}
               (FORMAT PARQUET, COMPRESSION ZSTD)
             """
         )
@@ -82,7 +79,7 @@ def _spill_stress_store(root: Path, *, non_final_battles: int) -> _SyntheticSpil
                      'player' AS winner_side,
                      'Dooley' AS winner_hero
               FROM range({non_final_battles + 1}) AS values(battle)
-            ) TO {release_module._sql_string(str(paths['battles']))}
+            ) TO {release_module._sql_string(str(paths["battles"]))}
               (FORMAT PARQUET, COMPRESSION ZSTD)
             """
         )
@@ -108,7 +105,7 @@ def _spill_stress_store(root: Path, *, non_final_battles: int) -> _SyntheticSpil
                      NULL::VARCHAR AS enchantment
               FROM range({non_final_battles + 1}) AS battles(battle)
               CROSS JOIN range(10) AS slots(slot)
-            ) TO {release_module._sql_string(str(paths['battle_cards']))}
+            ) TO {release_module._sql_string(str(paths["battle_cards"]))}
               (FORMAT PARQUET, COMPRESSION ZSTD)
             """
         )
@@ -125,9 +122,7 @@ def _seal(source_day: date) -> DaySeal:
         tuple(
             {
                 "source_hour": f"{source_day.isoformat()}T{hour:02d}",
-                "fact_commit_sha256": hashlib.sha256(
-                    f"{source_day}:{hour}".encode()
-                ).hexdigest(),
+                "fact_commit_sha256": hashlib.sha256(f"{source_day}:{hour}".encode()).hexdigest(),
             }
             for hour in range(24)
         ),
@@ -143,13 +138,10 @@ def test_check_8_window_is_consecutive_bounded_anchored_and_epoch_clamped() -> N
     selected = window_seals(seals, date(2026, 8, 16))
 
     assert [item.source_day for item in selected] == [
-        (date(2026, 8, 10) + timedelta(days=offset)).isoformat()
-        for offset in range(7)
+        (date(2026, 8, 10) + timedelta(days=offset)).isoformat() for offset in range(7)
     ]
     with_gap = tuple(item for item in seals if item.source_day != "2026-08-15")
-    assert [item.source_day for item in window_seals(with_gap, "2026-08-16")] == [
-        "2026-08-16"
-    ]
+    assert [item.source_day for item in window_seals(with_gap, "2026-08-16")] == ["2026-08-16"]
     with pytest.raises(ReleaseIdentityError, match="sealed anchor"):
         window_seals(seals, "2026-08-20")
     with pytest.raises(ReleaseIdentityError, match="epoch"):
@@ -162,21 +154,22 @@ def test_release_id_uses_the_exact_canonical_identity_chain() -> None:
         "anchor_day": "2026-08-08",
         "day_seal_sha256s": [item.day_seal_sha256 for item in seals],
         "hourly_fact_commit_sha256s": [
-            hourly["fact_commit_sha256"]
-            for item in seals
-            for hourly in item.hourly_fact_commits
+            hourly["fact_commit_sha256"] for item in seals for hourly in item.hourly_fact_commits
         ],
         "builder_code_version": "builder-test",
         "policy_version": "policy-test",
     }
     expected = "2026-08-08-" + hashlib.sha256(canonical_json(identity)).hexdigest()[:16]
 
-    assert compute_release_id(
-        "2026-08-08",
-        seals,
-        builder_code_version="builder-test",
-        policy_version="policy-test",
-    ) == expected
+    assert (
+        compute_release_id(
+            "2026-08-08",
+            seals,
+            builder_code_version="builder-test",
+            policy_version="policy-test",
+        )
+        == expected
+    )
 
 
 def test_release_derives_hero_outcomes_from_raw_side_name_facts(
@@ -184,15 +177,11 @@ def test_release_derives_hero_outcomes_from_raw_side_name_facts(
 ) -> None:
     store = sealed_store(tmp_path, 1)
 
-    release = ReleaseBuilder(tmp_path, store=store).build(
-        "2026-08-07", store.seals()
-    )
+    release = ReleaseBuilder(tmp_path, store=store).build("2026-08-07", store.seals())
 
     hero_window = json.loads((release.path / "window/heroes.json").read_bytes())
     dooley = next(
-        row
-        for row in hero_window["rows"]
-        if row["hero"] == "Dooley" and row["segment"] == "all"
+        row for row in hero_window["rows"] if row["hero"] == "Dooley" and row["segment"] == "all"
     )
     assert dooley["win_rate"] == 0.6
     assert dooley["matchups"] == [
@@ -281,7 +270,9 @@ def test_check_9_invalid_payload_never_promotes_the_staging_directory(
     with pytest.raises(ContractViolation, match="hero_daily"):
         builder.build("2026-08-07", store.seals())
 
-    assert not any(path.name.startswith("2026-08-07-") for path in (tmp_path / "releases").iterdir())
+    assert not any(
+        path.name.startswith("2026-08-07-") for path in (tmp_path / "releases").iterdir()
+    )
 
 
 def test_check_10_manifest_hash_size_and_exact_file_set_are_verified(
@@ -294,13 +285,13 @@ def test_check_10_manifest_hash_size_and_exact_file_set_are_verified(
             quality = stage / "quality.json"
             quality.write_bytes(quality.read_bytes() + b" ")
 
-    builder = ReleaseBuilder(
-        tmp_path, store=store, fault_injector=corrupt_after_inventory
-    )
+    builder = ReleaseBuilder(tmp_path, store=store, fault_injector=corrupt_after_inventory)
     with pytest.raises(ManifestMismatch, match="quality.json"):
         builder.build("2026-08-07", store.seals())
 
-    assert not any(path.name.startswith("2026-08-07-") for path in (tmp_path / "releases").iterdir())
+    assert not any(
+        path.name.startswith("2026-08-07-") for path in (tmp_path / "releases").iterdir()
+    )
 
 
 def test_check_11_manifest_release_identity_must_start_with_anchor(

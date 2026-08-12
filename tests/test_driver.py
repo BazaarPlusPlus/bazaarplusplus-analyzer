@@ -1,13 +1,13 @@
-from datetime import UTC, date, datetime, timedelta
 import json
 import os
-from pathlib import Path
 import shutil
 import time
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
-from bpp_analyzer.bundle_source import (
+from bppanalyzer.bundle_source import (
     Bundle,
     BundleRef,
     HourExpired,
@@ -15,12 +15,12 @@ from bpp_analyzer.bundle_source import (
     RetryableSourceError,
     raw_commit_sha256,
 )
-from bpp_analyzer.driver import PipelineDriver
-from bpp_analyzer.fact_store import FactStore
-from bpp_analyzer.locking import LockOwnershipLost, MaximumRunTimeExceeded
-from bpp_analyzer.object_store import LocalObjectStore
-from bpp_analyzer.projection import project_hour
-from bpp_analyzer.release import ReleaseBuilder
+from bppanalyzer.driver import PipelineDriver
+from bppanalyzer.fact_store import FactStore
+from bppanalyzer.locking import LockOwnershipLost, MaximumRunTimeExceeded
+from bppanalyzer.object_store import LocalObjectStore
+from bppanalyzer.projection import project_hour
+from bppanalyzer.release import ReleaseBuilder
 
 
 class ExpiredSource:
@@ -85,9 +85,7 @@ class QuarantinedBundleSource:
         return RawHourIndex(source_hour, items, raw_commit_sha256(items), 1)
 
     def stream(self, index: RawHourIndex):
-        return iter(
-            Bundle(item, None, None, 0, "fixture_invalid") for item in index.items
-        )
+        return iter(Bundle(item, None, None, 0, "fixture_invalid") for item in index.items)
 
 
 class SlowPointerStore(LocalObjectStore):
@@ -105,9 +103,7 @@ class StatusObservingSource(EmptySource):
     def hour_index(self, source_hour: datetime) -> RawHourIndex:
         self.calls += 1
         if self.calls == 2:
-            self.observed_status = json.loads(
-                (self.root / "status.json").read_bytes()
-            )
+            self.observed_status = json.loads((self.root / "status.json").read_bytes())
         return super().hour_index(source_hour)
 
 
@@ -175,9 +171,7 @@ def test_expired_hour_abandons_day_visibly_and_subsequent_runs_do_not_retry_or_e
     def observe(event: str) -> None:
         events.append(event)
         if event.startswith("abandoned "):
-            abandoned_status.append(
-                json.loads((tmp_path / "status.json").read_bytes())
-            )
+            abandoned_status.append(json.loads((tmp_path / "status.json").read_bytes()))
 
     first = driver.run(heal_days=11, progress_callback=observe)
 
@@ -222,9 +216,7 @@ def test_one_failed_hour_is_partial_exit_four_and_remains_visible_for_retry(
 ) -> None:
     now = datetime(2026, 8, 7, 1, 1, tzinfo=UTC)
 
-    result = PipelineDriver(
-        tmp_path, source=FailedSource(), clock=lambda: now
-    ).run(heal_days=8)
+    result = PipelineDriver(tmp_path, source=FailedSource(), clock=lambda: now).run(heal_days=8)
 
     assert result.outcome == "partial"
     assert result.exit_code == 4
@@ -265,9 +257,7 @@ def test_maximum_run_time_mid_heal_records_the_failed_run(tmp_path: Path) -> Non
     assert last_run["days_sealed"] == 0
     assert last_run["timings"]["total_seconds"] >= 0.05
     assert last_run["timings"]["heal_seconds"] >= 0.05
-    assert last_run["failures"] == [
-        {"scope": "run", "reason": "Maximum run time exceeded"}
-    ]
+    assert last_run["failures"] == [{"scope": "run", "reason": "Maximum run time exceeded"}]
     lines = (tmp_path / "runs.jsonl").read_text().splitlines()
     assert json.loads(lines[0]) == previous_run
     assert json.loads(lines[-1]) == last_run
@@ -294,9 +284,7 @@ def test_unexpected_mid_run_exception_records_progress_before_escaping(
     assert last_run["exit_code"] == 1
     assert last_run["hours_ingested"] == 1
     assert last_run["days_sealed"] == 0
-    assert last_run["failures"] == [
-        {"scope": "run", "reason": "unexpected mid-run failure"}
-    ]
+    assert last_run["failures"] == [{"scope": "run", "reason": "unexpected mid-run failure"}]
     lines = (tmp_path / "runs.jsonl").read_text().splitlines()
     assert json.loads(lines[-1]) == last_run
 
@@ -397,17 +385,11 @@ def test_hour_seal_and_release_build_progress_is_mirrored_to_the_run_log(
     assert events[0] == "heal plan: days=2 missing_settled_hours=1"
     healed = next(event for event in events if event.startswith("healed "))
     sealed = next(event for event in events if event.startswith("sealed "))
-    build_started = next(
-        event for event in events if event.startswith("release build started:")
-    )
-    build_done = next(
-        event for event in events if event.startswith("release build done:")
-    )
+    build_started = next(event for event in events if event.startswith("release build started:"))
+    build_done = next(event for event in events if event.startswith("release build done:"))
     assert healed.startswith("healed 2026-08-07T23 bundles=0 rows=0 bytes=")
     assert sealed.startswith("sealed 2026-08-07 rows=0 elapsed=")
-    assert build_started.startswith(
-        "release build started: release_id=2026-08-07-"
-    )
+    assert build_started.startswith("release build started: release_id=2026-08-07-")
     assert build_done.startswith("release build done: release_id=2026-08-07-")
     assert "reused=false" in build_done
     log = "".join(path.read_text() for path in (tmp_path / "logs").glob("*.log"))
@@ -427,21 +409,15 @@ def test_hour_progress_reports_index_and_streamed_bundle_counts(tmp_path: Path) 
 
     assert result.exit_code == 0
     assert any(
-        event.startswith(
-            "hour indexed: source_hour=2026-08-07T00 bundles=2 pages=1 elapsed="
-        )
+        event.startswith("hour indexed: source_hour=2026-08-07T00 bundles=2 pages=1 elapsed=")
         for event in events
     )
     assert any(
-        event.startswith(
-            "hour ingest progress: source_hour=2026-08-07T00 bundles=1/2 elapsed="
-        )
+        event.startswith("hour ingest progress: source_hour=2026-08-07T00 bundles=1/2 elapsed=")
         for event in events
     )
     assert any(
-        event.startswith(
-            "hour ingest progress: source_hour=2026-08-07T00 bundles=2/2 elapsed="
-        )
+        event.startswith("hour ingest progress: source_hour=2026-08-07T00 bundles=2/2 elapsed=")
         for event in events
     )
 

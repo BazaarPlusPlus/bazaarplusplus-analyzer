@@ -1,11 +1,11 @@
 """One-time freezing and offline verification for V5 golden releases."""
 
 import os
-from pathlib import Path
 import shutil
 import tempfile
+from pathlib import Path
 
-from bpp_analyzer.release import validate_release
+from bppanalyzer.release import validate_release
 
 
 class GoldenFreezeError(RuntimeError):
@@ -23,11 +23,7 @@ def freeze_release(
         raise GoldenFreezeError(f"Release directory does not exist: {source}")
     validate_release(source)
     release_id = source.name
-    root = (
-        Path(output_root).resolve()
-        if output_root is not None
-        else _default_golden_root()
-    )
+    root = Path(output_root).resolve() if output_root is not None else _default_golden_root()
     target = root / release_id
     if target.exists():
         raise GoldenFreezeError(f"Golden release already exists: {target}")

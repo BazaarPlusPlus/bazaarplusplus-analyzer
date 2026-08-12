@@ -1,16 +1,13 @@
-from datetime import UTC, date, datetime, timedelta
 import hashlib
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pyarrow as pa
 
-from bpp_analyzer.fact_store import FactStore
-from bpp_analyzer.projection import HourProjection, table_schemas
+from bppanalyzer.fact_store import FactStore
+from bppanalyzer.projection import HourProjection, table_schemas
 
-
-CARD_IDS = tuple(
-    f"00000000-0000-0000-0000-{index:012d}" for index in range(1, 11)
-)
+CARD_IDS = tuple(f"00000000-0000-0000-0000-{index:012d}" for index in range(1, 11))
 
 
 def sealed_store(root: Path, days: int, *, start: date = date(2026, 8, 7)) -> FactStore:
@@ -20,9 +17,7 @@ def sealed_store(root: Path, days: int, *, start: date = date(2026, 8, 7)) -> Fa
     return store
 
 
-def commit_sealed_day(
-    store: FactStore, source_day: date, *, day_offset: int = 0
-) -> None:
+def commit_sealed_day(store: FactStore, source_day: date, *, day_offset: int = 0) -> None:
     for hour_number in range(24):
         source_hour = datetime.combine(source_day, datetime.min.time(), UTC) + timedelta(
             hours=hour_number
@@ -32,9 +27,7 @@ def commit_sealed_day(
     store.seal_day(source_day)
 
 
-def _projection(
-    source_hour: datetime, rows: dict[str, list[dict[str, object]]]
-) -> HourProjection:
+def _projection(source_hour: datetime, rows: dict[str, list[dict[str, object]]]) -> HourProjection:
     schemas = table_schemas()
     tables = {
         name: pa.Table.from_pylist(rows.get(name, []), schema=schema)
@@ -48,9 +41,7 @@ def _projection(
     )
 
 
-def _populated_rows(
-    source_hour: datetime, day_offset: int
-) -> dict[str, list[dict[str, object]]]:
+def _populated_rows(source_hour: datetime, day_offset: int) -> dict[str, list[dict[str, object]]]:
     hour = source_hour.strftime("%Y-%m-%dT%H")
     day = source_hour.date().isoformat()
     run_id = f"run-{day}"

@@ -1,20 +1,19 @@
-from datetime import UTC, datetime
 import hashlib
 import json
 import threading
 import time
+from datetime import UTC, datetime
 
 import httpx
 import pytest
 
-from bpp_analyzer.bundle_source import (
+from bppanalyzer.bundle_source import (
     BundleSource,
     HourExpired,
     RetryableSourceError,
     SourceContractError,
 )
 from tests.bundle_fixtures import bundle_bytes
-
 
 HOUR = datetime(2026, 8, 10, 12, tzinfo=UTC)
 
@@ -417,9 +416,7 @@ def test_hour_index_exhausts_keyset_pages_and_returns_ordered_deduplicated_index
     assert [item.bundle_id for item in index.items] == ["bundle-a", "bundle-b"]
     assert index.pages == 2
     assert len(requests) == 2
-    assert requests[1].url.params["after_available_at_ms"] == str(
-        int(HOUR.timestamp() * 1_000) + 1
-    )
+    assert requests[1].url.params["after_available_at_ms"] == str(int(HOUR.timestamp() * 1_000) + 1)
     assert requests[1].url.params["after_bundle_id"] == "bundle-a"
     expected_identity = [
         {
@@ -540,8 +537,7 @@ def test_download_url_refresh_is_bounded_to_one_reenumeration() -> None:
 
 def test_stream_never_downloads_beyond_its_eight_bundle_lookahead() -> None:
     contents = {
-        f"bundle-{number:02d}": bundle_bytes(f"bundle-{number:02d}")
-        for number in range(20)
+        f"bundle-{number:02d}": bundle_bytes(f"bundle-{number:02d}") for number in range(20)
     }
     gate = threading.Event()
     eight_started = threading.Event()

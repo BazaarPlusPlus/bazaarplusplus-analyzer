@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Freeze a validated local V5 release as immutable contract goldens."""
 
-
 import argparse
-from pathlib import Path
 import sys
+from pathlib import Path
 
-from bpp_analyzer.goldens import GoldenFreezeError, freeze_release
-from bpp_analyzer.release import ReleaseBuildError
+from bppanalyzer.goldens import GoldenFreezeError, freeze_release
+from bppanalyzer.release import ReleaseBuildError
 
 
 def main(argv: list[str] | None = None) -> int:
