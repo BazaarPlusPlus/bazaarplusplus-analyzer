@@ -37,7 +37,7 @@ part of the analyzed population.
 _Avoid_: Valid row, usable record
 
 **Legend Segment**:
-Accepted Runs whose final rank is Legend.
+Accepted Runs whose canonical source value for final rank is `Legendary`.
 
 **Non-Legend Segment**:
 Accepted Runs whose final rank is recognized and is not Legend.

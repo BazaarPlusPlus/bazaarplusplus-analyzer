@@ -58,6 +58,8 @@ def payload(
     *,
     run_id: str = "run-1",
     account_id: str = "account-1",
+    hero: str = "Vanessa",
+    final_rank: str | None = "Legendary",
     started_at: str = "2026-08-10T12:00:00Z",
     battle_at: str = "2026-08-10T12:10:00Z",
     winner_combatant_id: str | None = None,
@@ -66,7 +68,7 @@ def payload(
     losses: int = 0,
     cards_per_set: int = 1,
 ) -> bytes:
-    player = [account_id, "Alice", "Vanessa", "Legendary", 1100, 10, 2, 10, 8, 12, 1, 1]
+    player = [account_id, "Alice", hero, final_rank, 1100, 10, 2, 10, 8, 12, 1, 1]
     opponent = ["account-2", "Bob", "Pygmalien", "Gold", 1050, 10, 2, 8, 8, 12, 1, 1]
     cards = [
         [
@@ -113,7 +115,7 @@ def payload(
         run_id,
         account_id,
         [
-            "Vanessa",
+            hero,
             "Ranked",
             42,
             started_at,
@@ -125,7 +127,7 @@ def payload(
             losses,
             "Gold",
             1000,
-            "Legendary",
+            final_rank,
             1100,
             100,
             50,

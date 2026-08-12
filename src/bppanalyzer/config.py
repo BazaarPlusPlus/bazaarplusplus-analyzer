@@ -22,7 +22,6 @@ class Config:
     max_run_seconds: int = 7200
     duckdb_memory_limit: str = "8GB"
     duckdb_threads: int = 8
-    keep_releases: int = 3
     r2_account_id: str | None = None
     r2_bucket: str | None = None
     r2_access_key_id: str | None = field(default=None, repr=False)
@@ -80,7 +79,6 @@ def load_config(
         ),
         duckdb_memory_limit=_memory_limit(values.get("BPP_DUCKDB_MEMORY_LIMIT")),
         duckdb_threads=_positive_int(values.get("BPP_DUCKDB_THREADS"), 8, "BPP_DUCKDB_THREADS"),
-        keep_releases=_positive_int(values.get("BPP_KEEP_RELEASES"), 3, "BPP_KEEP_RELEASES"),
         r2_account_id=r2_account_id,
         r2_bucket=r2_bucket,
         r2_access_key_id=r2_access_key_id,

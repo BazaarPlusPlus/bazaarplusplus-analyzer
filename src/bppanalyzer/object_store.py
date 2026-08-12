@@ -25,6 +25,7 @@ class ObjectStat:
     sha256: str
     bytes: int
     cache_control: str
+    content_type: str
     last_modified: datetime
 
 
@@ -45,7 +46,14 @@ class ObjectStore(Protocol):
 
     def get(self, key: str) -> StoredObject | None: ...
 
-    def put(self, key: str, body: bytes, *, cache_control: str) -> None: ...
+    def put(
+        self,
+        key: str,
+        body: bytes,
+        *,
+        cache_control: str,
+        content_type: str = "application/octet-stream",
+    ) -> None: ...
 
 
 class LocalObjectStore:
@@ -83,12 +91,21 @@ class LocalObjectStore:
             raise ObjectStoreError(f"Local object is unreadable: {key}") from error
         return StoredObject(body, stat)
 
-    def put(self, key: str, body: bytes, *, cache_control: str) -> None:
+    def put(
+        self,
+        key: str,
+        body: bytes,
+        *,
+        cache_control: str,
+        content_type: str = "application/octet-stream",
+    ) -> None:
         self.requests.append(StoreRequest("put", key))
         if not isinstance(body, bytes):
             raise TypeError("Object body must be bytes")
         if not cache_control:
             raise ValueError("Object Cache-Control is required")
+        if not content_type:
+            raise ValueError("Object Content-Type is required")
         object_path, metadata_path = self._paths(key)
         now = self._clock()
         if now.tzinfo is None or now.utcoffset() is None:
@@ -97,6 +114,7 @@ class LocalObjectStore:
             "sha256": hashlib.sha256(body).hexdigest(),
             "bytes": len(body),
             "cache_control": cache_control,
+            "content_type": content_type,
             "last_modified": now.astimezone(UTC).isoformat().replace("+00:00", "Z"),
         }
         _atomic_write(object_path, body)
@@ -126,6 +144,7 @@ class LocalObjectStore:
             or metadata.get("sha256") != digest
             or metadata.get("bytes") != len(body)
             or not isinstance(metadata.get("cache_control"), str)
+            or not isinstance(metadata.get("content_type"), str)
             or modified.tzinfo is None
         ):
             raise ObjectStoreError(f"Local object metadata differs from bytes: {key}")
@@ -134,6 +153,7 @@ class LocalObjectStore:
             sha256=digest,
             bytes=len(body),
             cache_control=metadata["cache_control"],
+            content_type=metadata["content_type"],
             last_modified=modified.astimezone(UTC),
         )
 
@@ -187,7 +207,14 @@ class R2ObjectStore:
         stat = _r2_stat(key, response, body=body)
         return StoredObject(body, stat)
 
-    def put(self, key: str, body: bytes, *, cache_control: str) -> None:
+    def put(
+        self,
+        key: str,
+        body: bytes,
+        *,
+        cache_control: str,
+        content_type: str = "application/octet-stream",
+    ) -> None:
         _safe_key(key)
         digest = hashlib.sha256(body).hexdigest()
         try:
@@ -196,7 +223,7 @@ class R2ObjectStore:
                 Key=key,
                 Body=body,
                 CacheControl=cache_control,
-                ContentType="application/json",
+                ContentType=content_type,
                 Metadata={"sha256": digest},
             )
         except (BotoCoreError, ClientError) as error:
@@ -207,11 +234,16 @@ def _r2_stat(key: str, response: dict, *, body: bytes | None = None) -> ObjectSt
     try:
         size = int(response["ContentLength"])
         cache_control = response["CacheControl"]
+        content_type = response["ContentType"]
         modified = response["LastModified"]
         metadata = response.get("Metadata", {})
     except (KeyError, TypeError, ValueError) as error:
         raise ObjectStoreError(f"R2 metadata is incomplete: {key}") from error
-    if not isinstance(cache_control, str) or not isinstance(modified, datetime):
+    if (
+        not isinstance(cache_control, str)
+        or not isinstance(content_type, str)
+        or not isinstance(modified, datetime)
+    ):
         raise ObjectStoreError(f"R2 metadata is incomplete: {key}")
     digest = metadata.get("sha256")
     if body is not None:
@@ -223,7 +255,7 @@ def _r2_stat(key: str, response: dict, *, body: bytes | None = None) -> ObjectSt
         raise ObjectStoreError(f"R2 object sha256 metadata is missing: {key}")
     if modified.tzinfo is None:
         modified = modified.replace(tzinfo=UTC)
-    return ObjectStat(key, digest, size, cache_control, modified.astimezone(UTC))
+    return ObjectStat(key, digest, size, cache_control, content_type, modified.astimezone(UTC))
 
 
 def _is_not_found(error: ClientError) -> bool:

@@ -31,6 +31,10 @@ A Run enters the fact layer only when all of the following are true:
 - its hero is in the canonical hero catalog;
 - its final rank is present and in the canonical rank catalog.
 
+The canonical rank catalog is `Bronze`, `Silver`, `Gold`, `Diamond`,
+`Master`, `Masters`, and `Legendary`. The `Legendary` source value maps to the
+`legend` consumer segment; every other canonical rank maps to `non_legend`.
+
 If either condition fails, the Run and all of its associated Battles and card
 snapshots are discarded before facts are written. Therefore the analyzed
 population has no unknown-rank segment and always satisfies:
@@ -68,6 +72,10 @@ Only `legend` and `non_legend` rows are stored. The Web site's `all` view is a
 field-wise sum of those two rows. Every day contains one row for every
 canonical hero and stored segment; a hero with no observations has zero
 counts and an empty `matchups` array.
+
+`days` is ordered newest first. Within each day, rows use canonical hero order
+(`Dooley`, `Jules`, `Karnok`, `Mak`, `Pygmalien`, `Stelle`, `TheDragons`,
+`Vanessa`), with `legend` before `non_legend` for each hero.
 
 ### Shape
 
@@ -306,6 +314,10 @@ A Build Candidate must have at least one Ten-Win Run. Its Representative
 Layout is the most frequently observed exact layout among its Ten-Win Runs;
 ties use canonical layout ordering.
 
+Canonical layout ordering sorts layout items by slot, card template ID, tier,
+enchantment, and size, serializes that normalized layout as canonical JSON,
+and compares those JSON values lexicographically.
+
 `p75_ten_win_final_day` uses the nearest-rank method over known Ten-Win final
 days:
 
@@ -366,7 +378,9 @@ from wall-clock time.
 ## Run report
 
 Every invocation emits one structured report to local status and logs. This
-report is operational evidence and is not a public R2 object.
+report is operational evidence and is not a public R2 object. When no complete
+Analysis Window exists, `window` is `null` and both `published` fields are
+false.
 
 ```json
 {
