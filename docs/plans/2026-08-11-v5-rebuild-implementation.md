@@ -70,8 +70,8 @@ skeleton.
   `seal_day`, `abandon_day`, `is_abandoned`, `seals()`, `hour_paths(days)`,
   `verify(day, deep)`.
 - Projection of Bundle segments into the five hourly tables (`runs`,
-  `battles`, `battle_cards`, `quality`, `quarantine`) — semantics from the
-  legacy repo, schemas owned by this rebuild.
+  `battles`, `battle_cards`, `quality`, `quarantine`) with schemas owned by
+  this repository.
 - `mkdir(.lock)` locking with heartbeat, stale takeover via atomic rename,
   ownership check, `BPP_MAX_RUN_SECONDS`.
 - CLI skeleton: `bpp run` (heal+seal working; build/publish stubs OK in this

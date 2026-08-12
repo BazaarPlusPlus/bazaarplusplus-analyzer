@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from datetime import UTC, date, datetime, timedelta
 import json
 import os
@@ -10,6 +8,8 @@ import time
 import pytest
 
 from bpp_analyzer.bundle_source import (
+    Bundle,
+    BundleRef,
     HourExpired,
     RawHourIndex,
     RetryableSourceError,
@@ -18,7 +18,9 @@ from bpp_analyzer.bundle_source import (
 from bpp_analyzer.driver import PipelineDriver
 from bpp_analyzer.fact_store import FactStore
 from bpp_analyzer.locking import LockOwnershipLost, MaximumRunTimeExceeded
+from bpp_analyzer.object_store import LocalObjectStore
 from bpp_analyzer.projection import project_hour
+from bpp_analyzer.release import ReleaseBuilder
 
 
 class ExpiredSource:
@@ -66,6 +68,34 @@ class EmptySource:
         return iter(())
 
 
+class QuarantinedBundleSource:
+    def hour_index(self, source_hour: datetime) -> RawHourIndex:
+        base_ms = int(source_hour.timestamp() * 1_000)
+        items = tuple(
+            BundleRef(
+                bundle_id=f"bundle-{offset}",
+                available_at_ms=base_ms + offset,
+                download_url=f"https://download.invalid/{offset}",
+                download_expires_at_ms=base_ms + 7_200_000,
+                sha256=None,
+                bytes=None,
+            )
+            for offset in range(2)
+        )
+        return RawHourIndex(source_hour, items, raw_commit_sha256(items), 1)
+
+    def stream(self, index: RawHourIndex):
+        return iter(
+            Bundle(item, None, None, 0, "fixture_invalid") for item in index.items
+        )
+
+
+class SlowPointerStore(LocalObjectStore):
+    def get(self, key: str):
+        time.sleep(0.1)
+        return super().get(key)
+
+
 class StatusObservingSource(EmptySource):
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -78,6 +108,16 @@ class StatusObservingSource(EmptySource):
             self.observed_status = json.loads(
                 (self.root / "status.json").read_bytes()
             )
+        return super().hour_index(source_hour)
+
+
+class FirstIndexStatusSource(EmptySource):
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.observed_status: dict | None = None
+
+    def hour_index(self, source_hour: datetime) -> RawHourIndex:
+        self.observed_status = json.loads((self.root / "status.json").read_bytes())
         return super().hour_index(source_hour)
 
 
@@ -162,10 +202,12 @@ def test_expired_hour_abandons_day_visibly_and_subsequent_runs_do_not_retry_or_e
     assert abandoned_status[0]["current_run"] == {
         "run_id": first.run_id,
         "phase": "heal",
+        "step": "abandoned",
         "current_hour": "2026-08-08T00",
         "hours_done": 0,
         "hours_planned": 24,
         "started_at": "2026-08-18T12:00:00Z",
+        "updated_at": "2026-08-18T12:00:00Z",
     }
 
     second = driver.run(heal_days=11)
@@ -259,7 +301,9 @@ def test_unexpected_mid_run_exception_records_progress_before_escaping(
     assert json.loads(lines[-1]) == last_run
 
 
-def test_ownership_lost_mid_run_does_not_write_run_reports(tmp_path: Path) -> None:
+def test_ownership_lost_mid_run_keeps_the_last_owned_checkpoint_only(
+    tmp_path: Path,
+) -> None:
     now = datetime(2026, 8, 7, 1, 1, tzinfo=UTC)
     status_before = b'{"last_run":{"run_id":"previous-run"}}\n'
     runs_before = b'{"run_id":"previous-run"}\n'
@@ -274,7 +318,10 @@ def test_ownership_lost_mid_run_does_not_write_run_reports(tmp_path: Path) -> No
             heartbeat_interval=60,
         ).run(heal_days=1)
 
-    assert (tmp_path / "status.json").read_bytes() == status_before
+    status = json.loads((tmp_path / "status.json").read_bytes())
+    assert status["last_run"] == {"run_id": "previous-run"}
+    assert status["current_run"]["step"] == "index"
+    assert status["current_run"]["current_hour"] == "2026-08-07T00"
     assert (tmp_path / "runs.jsonl").read_bytes() == runs_before
     heartbeat = json.loads((tmp_path / ".lock" / "heartbeat").read_bytes())
     assert heartbeat["run_id"] == "replacement-run"
@@ -348,14 +395,76 @@ def test_hour_seal_and_release_build_progress_is_mirrored_to_the_run_log(
 
     assert result.exit_code == 0
     assert events[0] == "heal plan: days=2 missing_settled_hours=1"
-    assert events[1].startswith("healed 2026-08-07T23 bundles=0 rows=0 bytes=")
-    assert events[2].startswith("sealed 2026-08-07 rows=0 elapsed=")
-    assert events[3].startswith("release build started: release_id=2026-08-07-")
-    assert events[4].startswith("release build done: release_id=2026-08-07-")
-    assert "reused=false" in events[4]
+    healed = next(event for event in events if event.startswith("healed "))
+    sealed = next(event for event in events if event.startswith("sealed "))
+    build_started = next(
+        event for event in events if event.startswith("release build started:")
+    )
+    build_done = next(
+        event for event in events if event.startswith("release build done:")
+    )
+    assert healed.startswith("healed 2026-08-07T23 bundles=0 rows=0 bytes=")
+    assert sealed.startswith("sealed 2026-08-07 rows=0 elapsed=")
+    assert build_started.startswith(
+        "release build started: release_id=2026-08-07-"
+    )
+    assert build_done.startswith("release build done: release_id=2026-08-07-")
+    assert "reused=false" in build_done
     log = "".join(path.read_text() for path in (tmp_path / "logs").glob("*.log"))
     for event in events:
         assert event in log
+
+
+def test_hour_progress_reports_index_and_streamed_bundle_counts(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 7, 1, 1, tzinfo=UTC)
+    events: list[str] = []
+
+    result = PipelineDriver(
+        tmp_path,
+        source=QuarantinedBundleSource(),
+        clock=lambda: now,
+    ).run(heal_days=1, progress_callback=events.append)
+
+    assert result.exit_code == 0
+    assert any(
+        event.startswith(
+            "hour indexed: source_hour=2026-08-07T00 bundles=2 pages=1 elapsed="
+        )
+        for event in events
+    )
+    assert any(
+        event.startswith(
+            "hour ingest progress: source_hour=2026-08-07T00 bundles=1/2 elapsed="
+        )
+        for event in events
+    )
+    assert any(
+        event.startswith(
+            "hour ingest progress: source_hour=2026-08-07T00 bundles=2/2 elapsed="
+        )
+        for event in events
+    )
+
+
+def test_run_summary_phase_timings_do_not_include_later_phases(tmp_path: Path) -> None:
+    source_day = date(2026, 8, 7)
+    now = datetime(2026, 8, 8, 0, 1, tzinfo=UTC)
+    store = FactStore(tmp_path, clock=lambda: now)
+    for hour in _hours(source_day):
+        index = RawHourIndex(hour, (), raw_commit_sha256(()), 1)
+        store.commit_hour(project_hour(index, ()))
+    store.seal_day(source_day)
+    ReleaseBuilder(tmp_path, store=store).build(source_day, store.seals())
+
+    result = PipelineDriver(
+        tmp_path,
+        source=NeverSource(),
+        clock=lambda: now,
+        object_store=SlowPointerStore(tmp_path / "objects"),
+    ).run(heal_days=2)
+
+    assert result.timings["publish_seconds"] >= 0.1
+    assert result.timings["build_seconds"] < 0.1
 
 
 def test_status_exposes_current_run_after_each_hour_commit_and_clears_at_end(
@@ -375,14 +484,41 @@ def test_status_exposes_current_run_after_each_hour_commit_and_clears_at_end(
     assert current == {
         "run_id": result.run_id,
         "phase": "heal",
-        "current_hour": "2026-08-07T00",
+        "step": "index",
+        "current_hour": "2026-08-07T01",
         "hours_done": 1,
         "hours_planned": 2,
         "started_at": "2026-08-07T02:01:00Z",
+        "updated_at": "2026-08-07T02:01:00Z",
     }
     final_status = json.loads((tmp_path / "status.json").read_bytes())
     assert final_status["current_run"] is None
     assert final_status["last_run"]["run_id"] == result.run_id
+
+
+def test_status_exposes_the_active_hour_before_source_indexing_starts(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 7, 1, 1, tzinfo=UTC)
+    source = FirstIndexStatusSource(tmp_path)
+
+    result = PipelineDriver(
+        tmp_path,
+        source=source,
+        clock=lambda: now,
+    ).run(heal_days=1)
+
+    assert source.observed_status is not None
+    assert source.observed_status["current_run"] == {
+        "run_id": result.run_id,
+        "phase": "heal",
+        "step": "index",
+        "current_hour": "2026-08-07T00",
+        "hours_done": 0,
+        "hours_planned": 1,
+        "started_at": "2026-08-07T01:01:00Z",
+        "updated_at": "2026-08-07T01:01:00Z",
+    }
 
 
 def test_hour_progress_marks_an_identical_commit_reused(tmp_path: Path) -> None:

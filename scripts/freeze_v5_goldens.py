@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Freeze a validated local V5 release as immutable contract goldens."""
 
-from __future__ import annotations
 
 import argparse
 from pathlib import Path

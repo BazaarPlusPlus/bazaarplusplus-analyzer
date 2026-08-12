@@ -1,7 +1,5 @@
 """Operator CLI for healing, sealing, status, and local verification."""
 
-from __future__ import annotations
-
 import json
 import uuid
 
@@ -130,13 +128,25 @@ def status_command(json_output: bool) -> None:
     click.echo(f"abandoned days: {len(facts.get('abandoned_days', []))}")
     current = value.get("current_run")
     if isinstance(current, dict):
-        click.echo(
-            f"current run: {current.get('run_id') or '-'} "
-            f"phase={current.get('phase') or '-'} "
-            f"hour={current.get('current_hour') or '-'} "
-            f"hours={current.get('hours_done', 0)}/{current.get('hours_planned', 0)} "
-            f"started={current.get('started_at') or '-'}"
+        bundles = current.get("bundles")
+        fields = [
+            f"current run: {current.get('run_id') or '-'}",
+            f"phase={current.get('phase') or '-'}",
+            f"step={current.get('step') or '-'}",
+            f"hour={current.get('current_hour') or '-'}",
+            f"hours={current.get('hours_done', 0)}/{current.get('hours_planned', 0)}",
+        ]
+        if isinstance(bundles, dict):
+            fields.append(
+                f"bundles={bundles.get('done', 0)}/{bundles.get('total', 0)}"
+            )
+        fields.extend(
+            [
+                f"updated={current.get('updated_at') or '-'}",
+                f"started={current.get('started_at') or '-'}",
+            ]
         )
+        click.echo(" ".join(fields))
     click.echo(f"last outcome: {last.get('outcome') if isinstance(last, dict) else '-'}")
 
 

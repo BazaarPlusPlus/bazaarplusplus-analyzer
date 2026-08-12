@@ -1,7 +1,5 @@
 """Atomic, immutable storage for hourly Parquet facts and Source Day seals."""
 
-from __future__ import annotations
-
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass, replace

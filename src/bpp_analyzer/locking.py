@@ -1,7 +1,5 @@
 """Single-machine mkdir lock with stale takeover and zombie fencing."""
 
-from __future__ import annotations
-
 from datetime import UTC, datetime
 import json
 import os
@@ -10,7 +8,7 @@ import shutil
 import socket
 import threading
 import time
-from typing import Callable
+from typing import Callable, Self
 
 
 class LockError(RuntimeError):
@@ -63,7 +61,7 @@ class DirectoryLock:
         self._thread: threading.Thread | None = None
         self.stale_run_id: str | None = None
 
-    def acquire(self) -> DirectoryLock:
+    def acquire(self) -> Self:
         self._root.mkdir(parents=True, exist_ok=True)
         stale_path = self._root / f".lock.stale-{self.run_id}"
         takeover_guard = self._root / ".lock.takeover"
@@ -179,7 +177,7 @@ class DirectoryLock:
         finally:
             self._started_monotonic = None
 
-    def __enter__(self) -> DirectoryLock:
+    def __enter__(self) -> Self:
         return self.acquire()
 
     def __exit__(

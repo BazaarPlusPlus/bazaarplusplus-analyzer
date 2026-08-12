@@ -1,7 +1,5 @@
 """Bounded, in-memory access to immutable Bundle Server Source Hours."""
 
-from __future__ import annotations
-
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -11,7 +9,7 @@ import json
 import re
 import threading
 import time
-from typing import Any, TypeVar
+from typing import Any, Self, TypeVar
 
 import httpx
 
@@ -159,7 +157,7 @@ class BundleSource:
         if self._owns_client:
             self._client.close()
 
-    def __enter__(self) -> BundleSource:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_args: object) -> None:

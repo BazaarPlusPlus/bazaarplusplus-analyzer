@@ -1,7 +1,5 @@
 """Strict repository ``.env`` configuration without ambient-env fallback."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 from pathlib import Path
 import re

@@ -1,7 +1,5 @@
 """Deterministic DuckDB analytics and atomic immutable local releases."""
 
-from __future__ import annotations
-
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
