@@ -1,7 +1,5 @@
 """Streaming projection from verified Bundle V5 objects to five Arrow tables."""
 
-from __future__ import annotations
-
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta

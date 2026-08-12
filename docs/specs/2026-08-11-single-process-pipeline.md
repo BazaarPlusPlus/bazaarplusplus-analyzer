@@ -1,14 +1,10 @@
-# Spec: Analyzer V5 Rebuild — Single-Process Pipeline and Publish Contract
+# Spec: Analyzer V5 — Single-Process Pipeline and Publish Contract
 
-A ground-up rewrite of Analyzer V5. One idempotent CLI converges "the newest
-complete Source Day is published" with all state on disk and in R2, and
-publishes a **new, two-layer consumer contract** designed from scratch. The V5
-name and R2 prefix are kept; everything else is new — the rebuild lives in its
-own repository (`bazaarplusplus-analyzer`) and carries over nothing from the
-legacy stack (`bazaarplusplus-analyzers`) — not code, not payload shapes, not
-data. It starts from an empty data root and bootstraps from the Bundle
-Server's ~14-day retention. The **epoch day is 2026-08-07**: healing starts
-there and no window ever reaches before it.
+One idempotent CLI converges "the newest complete Source Day is published"
+with all state on disk and in R2. It starts from an empty data root and an
+empty `analyzer-v5/` R2 prefix, then bootstraps from the Bundle Server's
+~14-day retention. The **epoch day is 2026-08-07**: healing starts there and
+no window ever reaches before it.
 
 ## Why this shape
 
@@ -39,9 +35,7 @@ bookkeeping back deliberately, via ADR.
 
 - What invokes `bpp run` (launchd/cron/CI — anything satisfying the trigger
   contract).
-- Compatibility with legacy payloads, golden vectors, or module boundaries.
-  The legacy stack keeps publishing to `analyzer-v5/` untouched until the
-  coordinated pointer flip (see Cutover); then it is deleted wholesale.
+- Compatibility with any other analyzer contract or data root.
 - Serving per-player profile queries. The public surface is static files; a
   queryable per-player API would be a different system.
 
@@ -51,10 +45,8 @@ bookkeeping back deliberately, via ADR.
 
 ## Principles
 
-1. **Name by content, not by consumer.** The legacy `web/`, `ladder/`, `mod/`
-   directories encoded who read a file, which is why the same hero-day
-   statistics existed twice and leaderboards three times. Files are named for
-   what they contain; any consumer reads any file.
+1. **Name by content, not by consumer.** Files are named for what they contain;
+   any consumer reads any file.
 2. **Two layers.**
    - `daily/` — per-Source-Day facts: raw, mergeable counts and accumulators.
      Content depends only on that day, so the same day's file is byte-identical
@@ -102,21 +94,12 @@ analyzer-v5/manifest.json         the pointer: byte-copy of the published
                                   release's manifest.json
 ```
 
-Five kinds total. What the legacy contract published and this one does not,
-and why:
-
-- `ladder/<day>.json` and `web/<day>.json` → merged into `daily/<day>.json`;
-  they were the same grain with inconsistent abstraction levels.
-- `ladder/players.json`, `ladder/top_by_class.json`, `ladder/top_overall.json`
-  → **dropped entirely. No per-player data is published at all.** Publishing
-  player performance profiles as immutable, world-readable, forever-cached
-  objects is a privacy decision, not a default; this contract's public
-  surface contains zero player identifiers. Record in an ADR; if a
-  leaderboard or player-profile feature is ever wanted, it is a new kind (or
-  a different surface) and a new decision.
-- Per-game-day battle splits (legacy `by_game_day`) → dropped by decision;
-  the hourly facts retain the data, so the kind can be reintroduced without
-  re-ingestion if it is ever missed.
+Five kinds total. No per-player data is published. Publishing player
+performance profiles as immutable, world-readable, forever-cached objects is
+a separate privacy decision; this contract's public surface contains zero
+player identifiers. Per-game-day battle splits are also outside the publish
+contract, while the hourly facts retain enough data to add them later without
+re-ingestion.
 
 ## `daily/<day>.json` — kind `hero_daily`
 
@@ -188,22 +171,19 @@ publishes them explicitly.
 }
 ```
 
-Contents are the legacy hero data carried forward — run result buckets, battle
-`win_rate`, `performance_rating`, opponent strength, rating distribution (now
-with order statistics), rank distribution, opponent-rank breakdown, ghost
-baseline (a field, not a parallel array), rating delta, ten-win pace, and the
-**windowed matchup matrix** — minus `by_game_day`, dropped by decision. With
-tens of heroes the matchup matrix is O(heroes²) ≈ thousands of small rows per
-segment: fine in one window file (it was only a size concern when repeated
-per day). This is also why no separate daily matchups kind exists.
+Contents include run result buckets, battle `win_rate`, `performance_rating`,
+opponent strength, rating distribution with order statistics, rank
+distribution, opponent-rank breakdown, ghost baseline, rating delta, ten-win
+pace, and the **windowed matchup matrix**. With tens of heroes the matchup
+matrix is O(heroes²) ≈ thousands of small rows per segment, so it fits in one
+window file. No separate daily matchups kind exists.
 
 ## `window/builds.json` — kind `builds`
 
-The V5 `mod_tenwin_builds` v3 design is kept on merit — columnar array
-encoding with a `schemas` block declaring tuple layouts, `card_index`,
-Wilson-scored selection with coverage back-fill. Changes are naming only:
-kind `builds`, envelope fields as above, selection thresholds moved into
-`params`, and scaled-integer fields keep their `_bps`/`_tenth` suffixes.
+Columnar array encoding uses a `schemas` block declaring tuple layouts, a
+`card_index`, and Wilson-scored selection with coverage back-fill. Selection
+thresholds live in `params`, and scaled-integer fields keep their
+`_bps`/`_tenth` suffixes.
 
 ## `manifest.json` and `quality.json`
 
@@ -216,8 +196,8 @@ kind `builds`, envelope fields as above, selection thresholds moved into
 }
 ```
 
-`quality.json` merges V5's `checks.json` + `_sli.json`: the release-build
-check results (each check id, pass, detail) and data-quality SLIs
+`quality.json` contains release-build check results (each check id, pass,
+detail) and data-quality SLIs
 (quarantine counts, timestamp-anomaly counts, per-day row counts). One file:
 "should I trust this release" is one read.
 
@@ -262,8 +242,7 @@ bpp show release <release_id>
   healing is clamped at the epoch day 2026-08-07 and never reaches before it.
 - `--anchor-day` — anchor the release at an explicit sealed day.
 - `--no-publish` — everything except R2 writes. The pointer `GET` still records
-  public state; a legacy or otherwise unparseable pointer is a warning, not a
-  run failure, because publication is not attempted.
+  public state; an invalid pointer is a run failure.
 - `--dry-run` — report the plan; write nothing; network = pointer `GET` only.
 - `verify` — recompute Parquet hashes against `_commit.json`; `--deep` also
   revalidates local releases against `contracts/v5/`. Operator tool, not run
@@ -303,17 +282,12 @@ status.json                       atomic health snapshot
 ```
 
 `facts/hourly/` — five tables per hour (`runs`, `battles`, `battle_cards`,
-`quality`, `quarantine`) plus `_commit.json`. The five-table split is kept
-from the legacy stack on merit, but the Parquet schemas are owned by this
-rebuild and free to change until the first production commit; after that,
-committed hours are read, never rewritten.
+`quality`, `quarantine`) plus `_commit.json`. The Parquet schemas are owned by
+this repository. Committed hours are read, never rewritten.
 
-`$BPP_DATA_ROOT` starts empty and lives outside the repo:
-`/Users/yxinyu/bpp-state/analyzer-v5/data`. This is a fresh tree — the legacy
-stack's `~/bpp-state/analyzers-v5/` is a different directory and is deleted
-with the legacy stack at cutover step 5. The rebuild runs directly on the
-host (no container), so `$BPP_DATA_ROOT` is the only path configuration — no
-host/container mount mapping.
+`$BPP_DATA_ROOT` starts empty and lives outside the repo at
+`/Users/yxinyu/bpp-state/analyzer-v5/data`. The pipeline runs directly on the
+host, so `$BPP_DATA_ROOT` is the only path configuration.
 
 **Local retention**: end of each successful run, prune `releases/<id>/` not
 (published ∨ hold target ∨ newest `BPP_KEEP_RELEASES`, default 3); prune
@@ -373,15 +347,21 @@ makes long outages survivable instead of infinitely retried.
 
 ## `status.json`, `runs.jsonl`, heartbeat
 
-`status.json` (atomic, rewritten every run including failures):
+`status.json` (atomic, rewritten at run start, hour-index start, ingest
+progress, phase transitions, and finalization including failures):
 `facts` {newest_sealed_day, sealed_days, incomplete_days (with missing hours,
 settled flag), abandoned_days}, `release` {publish_hold, local_newest_release_id,
-pointer_state ∈ ok|legacy_or_unparseable|absent, published_release_id,
+pointer_state ∈ ok|invalid|absent, published_release_id,
 published_window_end, published_manifest_age_seconds},
+`current_run` {run_id, phase, step, current_hour, hours_done, hours_planned,
+optional bundles {done,total}, started_at, updated_at},
 `last_run` {run_id, timings, outcome ∈ ok|noop|partial|error, exit_code,
 hours_ingested, days_sealed, release_built, release_published, failures[]},
 `disk` free-bytes, `peak_rss_bytes`. `published_*` always comes from the
-pointer `GET` — R2 is the authority; a manual pointer change cannot desync.
+pointer `GET` — R2 is the authority. Phase timings are non-overlapping.
+
+The CLI mirrors the same milestones to stdout unless `--quiet` is set. During
+ingest it reports the first Bundle, every 250 Bundles, and the final Bundle.
 
 `runs.jsonl`: one line per run, same object as `last_run`, append-only.
 `.lock/heartbeat`: `{run_id, pid, started_at, hostname}`.
@@ -528,10 +508,9 @@ the check is removed.
 
 **Publish**
 12. The current pointer parses; its `release_id` matches the frozen pattern
-    and is prefixed by its own window end. Unparseable pointer blocks
-    publication. If publication is gated off (`--no-publish` or
-    `publish-hold.json`), record `legacy_or_unparseable` plus a warning and do
-    not fail the otherwise successful/no-op run.
+    and is prefixed by its own window end. An invalid pointer is recorded as
+    `pointer_state: invalid` and fails the run, even when publication is gated
+    off.
 13. Anti-regression: new window end `>=` published window end (`>=` so a
     corrected same-anchor release ships). Only `rollback` moves backward.
 14. Immutable-key conflict (differing bytes at an existing release key) is a
@@ -569,43 +548,6 @@ the check is removed.
     zero-row commit, no seal), visibly in `status.json`; subsequent runs
     neither retry nor exit 4 for it.
 12. **All 17 checks** have a removal-detecting test.
-
-## Cutover
-
-The rebuild reuses the `analyzer-v5/` prefix, so the pointer flip **is** the
-consumer-breaking moment and must be coordinated — unlike a new prefix, there
-is no gradual migration. The legacy stack keeps running untouched until step 5.
-
-1. Contracts first: author `contracts/v5/` schemas in the new repo (the
-   legacy repo is not touched at all); review the shapes with both consumers
-   (site, mod) before any pipeline code.
-2. Build the pipeline against the new contracts, in a fresh data root. The
-   first `bpp run` heals as far back as it can reach (up to the epoch floor
-   2026-08-07); days already past the expiry guard by then are simply
-   abandoned and the effective history starts later. This is acceptable, not
-   a deadline: the release window is at most 7 days, so early history's only
-   value is widening the first few windows — after one week of running, the
-   bootstrap date is invisible. Generate golden vectors from the first full
-   build; freeze them.
-3. Run `bpp run --no-publish` alongside the legacy stack for several days:
-   sanity-check the new numbers against legacy output where windows overlap
-   (semantic spot-checks, not byte comparison — there is nothing to be
-   byte-equal to). The still-legacy public pointer is expected here: each run
-   records `pointer_state: legacy_or_unparseable` and warns, but its outcome is
-   determined by the heal/seal/build work rather than failing check 12.
-4. The flip, as one coordinated change: consumers deploy support for the new
-   payloads, the legacy scheduler is stopped, and the first `bpp run` publish
-   replaces `analyzer-v5/manifest.json` with the new-format pointer. Legacy
-   immutable release objects stay readable at their old keys (never-delete);
-   `rollback` cannot cross the flip — the last legacy release is not a valid
-   rollback target for the new pointer format.
-5. Retire the legacy stack wholesale: stop and remove the Docker deployment
-   (Dagster, Postgres, compose), archive the `bazaarplusplus-analyzers` repo,
-   and delete the legacy data root `~/bpp-state/analyzers-v5/`. Write the
-   ADRs in the new repo (single-process idempotent pipeline + mutable-store
-   red line; Bundle bytes never persisted, hourly facts as first recovery
-   authority; Day Seal; zero per-player data published; R2 never-delete;
-   single-writer) and write the runbooks fresh.
 
 ## Unresolved, needs measurement
 

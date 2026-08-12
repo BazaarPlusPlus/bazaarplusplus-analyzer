@@ -1,7 +1,5 @@
 """Oldest-first heal/seal convergence and local health reporting."""
 
-from __future__ import annotations
-
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 import json
@@ -39,8 +37,9 @@ from bpp_analyzer.release import (
 
 DEFAULT_HEAL_DAYS = 8
 DEFAULT_SETTLE_LAG = timedelta(seconds=60)
+BUNDLE_PROGRESS_EVERY = 250
 POINTER_STATE_OK = "ok"
-POINTER_STATE_LEGACY_OR_UNPARSEABLE = "legacy_or_unparseable"
+POINTER_STATE_INVALID = "invalid"
 POINTER_STATE_ABSENT = "absent"
 
 
@@ -208,16 +207,26 @@ class PipelineDriver:
                     if error_callback is not None:
                         error_callback(message)
 
-                def checkpoint(phase: str, current_hour: str | None) -> None:
+                def checkpoint(
+                    phase: str,
+                    current_hour: str | None,
+                    *,
+                    step: str,
+                    bundles_done: int | None = None,
+                    bundles_total: int | None = None,
+                ) -> None:
                     try:
                         _write_current_status(
                             self.data_root,
                             store,
                             run_id=run_id,
                             phase=phase,
+                            step=step,
                             current_hour=current_hour,
                             hours_done=progress.hours_ingested,
                             hours_planned=progress.hours_planned,
+                            bundles_done=bundles_done,
+                            bundles_total=bundles_total,
                             started_at=now,
                             now=_aware_utc(self.clock()),
                             considered_days=healing_days(now, heal_days),
@@ -267,7 +276,7 @@ class PipelineDriver:
                         builder_code_version=builder.builder_code_version,
                         policy_version=builder.policy_version,
                     )
-                    checkpoint("build", None)
+                    checkpoint("build", None, step="build")
                     report(f"release build started: release_id={release_id}")
                     local = builder.build(selected_anchor, seals)
                     report(
@@ -281,9 +290,10 @@ class PipelineDriver:
                             outcome="ok" if summary.outcome == "noop" else summary.outcome,
                             release_built=local.release_id,
                         )
+                build_seconds = time.monotonic() - build_started
                 publish_started = time.monotonic()
                 if publisher is not None:
-                    checkpoint("publish", None)
+                    checkpoint("publish", None, step="pointer_check")
                     pointer_started = time.monotonic()
                     report("publish pointer check started")
                     hold = (self.data_root / "publish-hold.json").is_file()
@@ -291,18 +301,13 @@ class PipelineDriver:
                     try:
                         published_pointer = publisher.current_pointer()
                     except InvalidPointer:
-                        pointer_state = POINTER_STATE_LEGACY_OR_UNPARSEABLE
+                        pointer_state = POINTER_STATE_INVALID
                         report(
                             "publish pointer check done: published_release_id=none "
                             f"elapsed={_format_elapsed(time.monotonic() - pointer_started)} "
                             f"pointer_state={pointer_state}"
                         )
-                        if publish_candidate:
-                            raise
-                        report(
-                            "warning: public pointer is legacy or unparseable; "
-                            "publication was not attempted"
-                        )
+                        raise
                     else:
                         pointer_state = (
                             POINTER_STATE_OK
@@ -323,6 +328,7 @@ class PipelineDriver:
                         )
                     ):
                         publish_action_started = time.monotonic()
+                        checkpoint("publish", None, step="upload")
                         report(f"publish started: release_id={local.release_id}")
                         published = publisher.publish(
                             local,
@@ -354,6 +360,7 @@ class PipelineDriver:
                         report(
                             f"publish skipped: release_id={local.release_id} already published"
                         )
+                publish_seconds = time.monotonic() - publish_started
                 if summary.exit_code == 0:
                     _prune_releases(
                         self.data_root,
@@ -373,10 +380,10 @@ class PipelineDriver:
                             max(time.monotonic() - started_monotonic, 0.0), 6
                         ),
                         "build_seconds": round(
-                            max(time.monotonic() - build_started, 0.0), 6
+                            max(build_seconds, 0.0), 6
                         ),
                         "publish_seconds": round(
-                            max(time.monotonic() - publish_started, 0.0), 6
+                            max(publish_seconds, 0.0), 6
                         ),
                     },
                     peak_rss_bytes=peak_rss_bytes(),
@@ -464,7 +471,7 @@ class PipelineDriver:
         log: Callable[[str], None],
         report: Callable[[str], None],
         report_error: Callable[[str], None],
-        checkpoint: Callable[[str, str | None], None],
+        checkpoint: Callable[..., None],
     ) -> RunSummary:
         heal_started = time.monotonic()
         progress.heal_started_monotonic = heal_started
@@ -487,20 +494,76 @@ class PipelineDriver:
             f"missing_settled_hours={hours_planned}"
         )
 
+        hours_started = 0
         for day, planned_hours in planned_by_day.items():
             lock.assert_owned()
             day_started = time.monotonic()
             expired_reason: str | None = None
             for hour in planned_hours:
                 lock.assert_owned()
+                hours_started += 1
                 try:
                     hour_started = time.monotonic()
+                    hour_key = hour.strftime("%Y-%m-%dT%H")
+                    report(
+                        f"hour started: source_hour={hour_key} "
+                        f"[{hours_started}/{hours_planned}]"
+                    )
+                    checkpoint("heal", hour_key, step="index")
+                    index_started = time.monotonic()
                     index = self.source.hour_index(hour)
-                    projected = project_hour(index, self.source.stream(index))
+                    report(
+                        f"hour indexed: source_hour={hour_key} "
+                        f"bundles={len(index.items)} pages={index.pages} "
+                        f"elapsed={_format_elapsed(time.monotonic() - index_started)}"
+                    )
+                    report(
+                        f"hour ingest started: source_hour={hour_key} "
+                        f"bundles={len(index.items)}"
+                    )
+                    checkpoint(
+                        "heal",
+                        hour_key,
+                        step="ingest",
+                        bundles_done=0,
+                        bundles_total=len(index.items),
+                    )
+                    ingest_started = time.monotonic()
+
+                    def observed_bundles():
+                        for completed, bundle in enumerate(
+                            self.source.stream(index), start=1
+                        ):
+                            yield bundle
+                            if (
+                                completed == 1
+                                or completed == len(index.items)
+                                or completed % BUNDLE_PROGRESS_EVERY == 0
+                            ):
+                                report(
+                                    f"hour ingest progress: source_hour={hour_key} "
+                                    f"bundles={completed}/{len(index.items)} "
+                                    f"elapsed={_format_elapsed(time.monotonic() - ingest_started)}"
+                                )
+                                checkpoint(
+                                    "heal",
+                                    hour_key,
+                                    step="ingest",
+                                    bundles_done=completed,
+                                    bundles_total=len(index.items),
+                                )
+
+                    projected = project_hour(index, observed_bundles())
                     commit = store.commit_hour(projected)
                     progress.hours_ingested += 1
                     progress.changed = True
-                    checkpoint("heal", commit.source_hour)
+                    checkpoint(
+                        "heal",
+                        commit.source_hour,
+                        step="complete",
+                        bundles_done=commit.bundle_count,
+                        bundles_total=len(index.items),
+                    )
                     reused = " reused" if commit.reused else ""
                     report(
                         f"healed {commit.source_hour} bundles={commit.bundle_count} "
@@ -538,7 +601,11 @@ class PipelineDriver:
                 log(f"source day abandoned: {day.isoformat()} ({expired_reason})")
                 progress.days_abandoned += 1
                 progress.changed = True
-                checkpoint("heal", hour.strftime("%Y-%m-%dT%H"))
+                checkpoint(
+                    "heal",
+                    hour.strftime("%Y-%m-%dT%H"),
+                    step="abandoned",
+                )
                 report(
                     f"abandoned {day.isoformat()} missing={len(remaining)} "
                     f"reason={expired_reason} "
@@ -550,7 +617,11 @@ class PipelineDriver:
                     seal = store.seal_day(day)
                     progress.days_sealed += 1
                     progress.changed = True
-                    checkpoint("heal", f"{day.isoformat()}T23")
+                    checkpoint(
+                        "heal",
+                        f"{day.isoformat()}T23",
+                        step="seal",
+                    )
                     report(
                         f"sealed {day.isoformat()} rows={sum(seal.row_counts.values())} "
                         f"elapsed={_format_elapsed(time.monotonic() - day_started)}"
@@ -745,9 +816,12 @@ def _write_current_status(
     *,
     run_id: str,
     phase: str,
+    step: str,
     current_hour: str | None,
     hours_done: int,
     hours_planned: int,
+    bundles_done: int | None,
+    bundles_total: int | None,
     started_at: datetime,
     now: datetime,
     considered_days: tuple[date, ...],
@@ -788,11 +862,18 @@ def _write_current_status(
     status["current_run"] = {
         "run_id": run_id,
         "phase": phase,
+        "step": step,
         "current_hour": current_hour,
         "hours_done": hours_done,
         "hours_planned": hours_planned,
         "started_at": _aware_utc(started_at).isoformat().replace("+00:00", "Z"),
+        "updated_at": _aware_utc(now).isoformat().replace("+00:00", "Z"),
     }
+    if bundles_total is not None:
+        status["current_run"]["bundles"] = {
+            "done": bundles_done or 0,
+            "total": bundles_total,
+        }
     _write_status(root, status, ownership_check)
 
 
@@ -856,7 +937,7 @@ def _failed_summary(
     )
 
 
-def _try_log(run_log: _RunLog | None, message: str) -> None:
+def _try_log(run_log: "_RunLog | None", message: str) -> None:
     if run_log is None:
         return
     try:
@@ -875,7 +956,7 @@ def _write_run_reports(
     published_pointer: PublishedPointer | None,
     pointer_state: str | None,
     ownership_check: Callable[[], None],
-    run_log: _RunLog | None,
+    run_log: "_RunLog | None",
 ) -> tuple[RunSummary, BaseException | None]:
     reporting_error: BaseException | None = None
     status: dict[str, Any] | None = None

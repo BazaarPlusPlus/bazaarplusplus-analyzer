@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from datetime import UTC, datetime
 from functools import partial
 import json
@@ -63,26 +61,6 @@ class NeverContextSource(EmptyContextSource):
 
 def _config(root: Path) -> Config:
     return Config(root, "https://api.invalid", "test-token")
-
-
-def _legacy_pointer_bytes() -> bytes:
-    return (
-        json.dumps(
-            {
-                "schema_version": "2",
-                "namespace": "analyzer-v5",
-                "release_id": "2026-08-07-0000000000000000",
-                "generated_at": "2026-08-08T00:00:00Z",
-                "source": {"source_end_day": "2026-08-07"},
-                "web": {},
-                "ladder": {},
-                "mod": {},
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n"
-    ).encode()
 
 
 def test_cli_maps_success_usage_lock_and_partial_outcomes_to_frozen_exit_codes(
@@ -151,10 +129,17 @@ def test_cli_run_streams_the_heal_plan_and_zero_row_hour_progress(
     assert result.exit_code == 0
     lines = result.output.splitlines()
     assert lines[0] == "heal plan: days=1 missing_settled_hours=1"
-    assert lines[1].startswith(
+    assert lines[1] == "hour started: source_hour=2026-08-07T00 [1/1]"
+    assert lines[2].startswith(
+        "hour indexed: source_hour=2026-08-07T00 bundles=0 pages=1 elapsed="
+    )
+    assert lines[3] == (
+        "hour ingest started: source_hour=2026-08-07T00 bundles=0"
+    )
+    assert lines[4].startswith(
         "healed 2026-08-07T00 bundles=0 rows=0 bytes="
     )
-    assert lines[1].endswith("[1/1]")
+    assert lines[4].endswith("[1/1]")
     assert lines[-1] == "ok: 1 hours ingested, 0 days sealed, 0 days abandoned"
 
 
@@ -222,87 +207,17 @@ def test_cli_noop_prints_no_per_hour_progress_and_uses_one_pointer_get(
     ]
 
 
-def test_cli_no_publish_builds_beside_legacy_pointer_without_failing(
-    tmp_path: Path, monkeypatch
-) -> None:
-    data_root = tmp_path / "data"
-    now = datetime(2026, 8, 7, 23, 59, tzinfo=UTC)
-    sealed_store(data_root, 1)
-    (data_root / "status.json").write_text(
-        json.dumps(
-            {
-                "release": {
-                    "pointer_state": "ok",
-                    "published_release_id": "2026-08-06-ffffffffffffffff",
-                    "published_window_end": "2026-08-06",
-                    "published_manifest_age_seconds": 60.0,
-                },
-                "last_run": None,
-            }
-        )
-    )
-    objects = LocalObjectStore(tmp_path / "fake-r2", clock=lambda: now)
-    objects.put(
-        POINTER_KEY,
-        _legacy_pointer_bytes(),
-        cache_control=POINTER_CACHE_CONTROL,
-    )
-    objects.clear_requests()
-    monkeypatch.setattr(cli, "load_config", lambda **_kwargs: _config(data_root))
-    monkeypatch.setattr(cli, "BundleSource", NeverContextSource)
-    monkeypatch.setattr(
-        cli,
-        "PipelineDriver",
-        partial(PipelineDriver, clock=lambda: now),
-    )
-    monkeypatch.setattr(cli, "_object_store", lambda _config: objects)
-
-    result = CliRunner().invoke(
-        cli.main,
-        [
-            "run",
-            "--heal-days",
-            "1",
-            "--anchor-day",
-            "2026-08-07",
-            "--no-publish",
-        ],
-    )
-
-    assert result.exit_code == 0
-    assert "warning: public pointer is legacy or unparseable" in result.output
-    assert result.output.splitlines()[-1].startswith("ok:")
-    status = json.loads((data_root / "status.json").read_bytes())
-    assert status["last_run"]["outcome"] == "ok"
-    assert status["last_run"]["exit_code"] == 0
-    assert status["last_run"]["release_built"] is not None
-    assert status["last_run"]["release_published"] is None
-    assert status["release"]["pointer_state"] == "legacy_or_unparseable"
-    assert status["release"]["published_release_id"] is None
-    assert status["release"]["published_window_end"] is None
-    assert status["release"]["published_manifest_age_seconds"] is None
-    assert (
-        status["release"]["local_newest_release_id"]
-        == status["last_run"]["release_built"]
-    )
-    assert [(request.operation, request.key) for request in objects.requests] == [
-        ("get", POINTER_KEY)
-    ]
-    log = "".join(path.read_text() for path in (data_root / "logs").glob("*.log"))
-    assert "warning: public pointer is legacy or unparseable" in log
-
-
-def test_cli_publish_enabled_run_records_legacy_pointer_as_error_exit_one(
+def test_cli_run_records_an_invalid_pointer_as_error_exit_one(
     tmp_path: Path, monkeypatch
 ) -> None:
     data_root = tmp_path / "data"
     now = datetime(2026, 8, 7, 23, 59, tzinfo=UTC)
     sealed_store(data_root, 1)
     objects = LocalObjectStore(tmp_path / "fake-r2", clock=lambda: now)
-    legacy_pointer = _legacy_pointer_bytes()
+    invalid_pointer = b"not-json\n"
     objects.put(
         POINTER_KEY,
-        legacy_pointer,
+        invalid_pointer,
         cache_control=POINTER_CACHE_CONTROL,
     )
     objects.clear_requests()
@@ -327,90 +242,10 @@ def test_cli_publish_enabled_run_records_legacy_pointer_as_error_exit_one(
     assert status["last_run"]["exit_code"] == 1
     assert status["last_run"]["release_built"] is not None
     assert status["last_run"]["release_published"] is None
-    assert status["release"]["pointer_state"] == "legacy_or_unparseable"
+    assert status["release"]["pointer_state"] == "invalid"
     assert status["release"]["published_release_id"] is None
-    assert objects.get(POINTER_KEY).body == legacy_pointer
+    assert objects.get(POINTER_KEY).body == invalid_pointer
     assert [(request.operation, request.key) for request in objects.requests[:-1]] == [
-        ("get", POINTER_KEY)
-    ]
-
-
-def test_cli_publish_command_blocks_legacy_pointer_before_any_write(
-    tmp_path: Path, monkeypatch
-) -> None:
-    data_root = tmp_path / "data"
-    facts = sealed_store(data_root, 1)
-    local = ReleaseBuilder(data_root, store=facts).build(
-        "2026-08-07",
-        facts.seals(),
-    )
-    objects = LocalObjectStore(tmp_path / "fake-r2")
-    legacy_pointer = _legacy_pointer_bytes()
-    objects.put(
-        POINTER_KEY,
-        legacy_pointer,
-        cache_control=POINTER_CACHE_CONTROL,
-    )
-    objects.clear_requests()
-    monkeypatch.setattr(cli, "load_config", lambda **_kwargs: _config(data_root))
-    monkeypatch.setattr(cli, "_object_store", lambda _config: objects)
-
-    result = CliRunner().invoke(cli.main, ["publish", local.release_id])
-
-    assert result.exit_code == 1
-    assert "Public pointer does not match the frozen manifest contract" in result.output
-    assert objects.get(POINTER_KEY).body == legacy_pointer
-    assert [(request.operation, request.key) for request in objects.requests[:-1]] == [
-        ("get", POINTER_KEY)
-    ]
-
-
-def test_cli_publish_hold_allows_run_beside_legacy_pointer(
-    tmp_path: Path, monkeypatch
-) -> None:
-    data_root = tmp_path / "data"
-    now = datetime(2026, 8, 7, 23, 59, tzinfo=UTC)
-    sealed_store(data_root, 1)
-    (data_root / "publish-hold.json").write_text(
-        json.dumps(
-            {
-                "target_release_id": "2026-08-07-0000000000000000",
-                "reason": "cutover fixture",
-            }
-        )
-    )
-    objects = LocalObjectStore(tmp_path / "fake-r2", clock=lambda: now)
-    objects.put(
-        POINTER_KEY,
-        _legacy_pointer_bytes(),
-        cache_control=POINTER_CACHE_CONTROL,
-    )
-    objects.clear_requests()
-    monkeypatch.setattr(cli, "load_config", lambda **_kwargs: _config(data_root))
-    monkeypatch.setattr(cli, "BundleSource", NeverContextSource)
-    monkeypatch.setattr(
-        cli,
-        "PipelineDriver",
-        partial(PipelineDriver, clock=lambda: now),
-    )
-    monkeypatch.setattr(cli, "_object_store", lambda _config: objects)
-
-    result = CliRunner().invoke(
-        cli.main,
-        ["run", "--heal-days", "1", "--anchor-day", "2026-08-07"],
-    )
-
-    assert result.exit_code == 0
-    assert "warning: public pointer is legacy or unparseable" in result.output
-    assert "hold active" in result.output
-    status = json.loads((data_root / "status.json").read_bytes())
-    assert status["last_run"]["outcome"] == "ok"
-    assert status["last_run"]["exit_code"] == 0
-    assert status["last_run"]["release_built"] is not None
-    assert status["release"]["publish_hold"] is True
-    assert status["release"]["pointer_state"] == "legacy_or_unparseable"
-    assert status["release"]["published_release_id"] is None
-    assert [(request.operation, request.key) for request in objects.requests] == [
         ("get", POINTER_KEY)
     ]
 
@@ -452,10 +287,13 @@ def test_cli_status_text_shows_live_current_run_progress(
         "current_run": {
             "run_id": "live-run",
             "phase": "heal",
+            "step": "ingest",
             "current_hour": "2026-08-07T00",
             "hours_done": 1,
             "hours_planned": 2,
+            "bundles": {"done": 250, "total": 2000},
             "started_at": "2026-08-07T02:01:00Z",
+            "updated_at": "2026-08-07T02:03:00Z",
         },
         "last_run": {"outcome": "ok"},
     }
@@ -470,6 +308,7 @@ def test_cli_status_text_shows_live_current_run_progress(
 
     assert result.exit_code == 0
     assert (
-        "current run: live-run phase=heal hour=2026-08-07T00 "
-        "hours=1/2 started=2026-08-07T02:01:00Z"
+        "current run: live-run phase=heal step=ingest hour=2026-08-07T00 "
+        "hours=1/2 bundles=250/2000 updated=2026-08-07T02:03:00Z "
+        "started=2026-08-07T02:01:00Z"
     ) in result.output
