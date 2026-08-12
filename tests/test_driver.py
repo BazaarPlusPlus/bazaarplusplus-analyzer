@@ -4,6 +4,7 @@ from datetime import UTC, date, datetime, timedelta
 import json
 import os
 from pathlib import Path
+import shutil
 import time
 
 import pytest
@@ -17,6 +18,7 @@ from bpp_analyzer.bundle_source import (
 from bpp_analyzer.driver import PipelineDriver
 from bpp_analyzer.fact_store import FactStore
 from bpp_analyzer.locking import LockOwnershipLost, MaximumRunTimeExceeded
+from bpp_analyzer.projection import project_hour
 
 
 class ExpiredSource:
@@ -54,6 +56,29 @@ class SlowEmptySource:
 
     def stream(self, _index):
         return iter(())
+
+
+class EmptySource:
+    def hour_index(self, source_hour: datetime) -> RawHourIndex:
+        return RawHourIndex(source_hour, (), raw_commit_sha256(()), 1)
+
+    def stream(self, _index):
+        return iter(())
+
+
+class StatusObservingSource(EmptySource):
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.calls = 0
+        self.observed_status: dict | None = None
+
+    def hour_index(self, source_hour: datetime) -> RawHourIndex:
+        self.calls += 1
+        if self.calls == 2:
+            self.observed_status = json.loads(
+                (self.root / "status.json").read_bytes()
+            )
+        return super().hour_index(source_hour)
 
 
 class UnexpectedSecondHourSource:
@@ -104,8 +129,17 @@ def test_expired_hour_abandons_day_visibly_and_subsequent_runs_do_not_retry_or_e
             store.abandon_day(day, _hours(day), "test setup")
     source = ExpiredSource()
     driver = PipelineDriver(tmp_path, source=source, clock=lambda: now)
+    events: list[str] = []
+    abandoned_status: list[dict] = []
 
-    first = driver.run(heal_days=11)
+    def observe(event: str) -> None:
+        events.append(event)
+        if event.startswith("abandoned "):
+            abandoned_status.append(
+                json.loads((tmp_path / "status.json").read_bytes())
+            )
+
+    first = driver.run(heal_days=11, progress_callback=observe)
 
     assert first.exit_code == 0
     assert first.outcome == "ok"
@@ -122,6 +156,17 @@ def test_expired_hour_abandons_day_visibly_and_subsequent_runs_do_not_retry_or_e
     assert "source day abandoned: 2026-08-08" in "".join(
         path.read_text() for path in (tmp_path / "logs").glob("*.log")
     )
+    assert next(event for event in events if event.startswith("abandoned ")).startswith(
+        "abandoned 2026-08-08 missing=24 reason=source_hour_expired elapsed="
+    )
+    assert abandoned_status[0]["current_run"] == {
+        "run_id": first.run_id,
+        "phase": "heal",
+        "current_hour": "2026-08-08T00",
+        "hours_done": 0,
+        "hours_planned": 24,
+        "started_at": "2026-08-18T12:00:00Z",
+    }
 
     second = driver.run(heal_days=11)
 
@@ -282,3 +327,81 @@ def test_stale_takeover_records_the_displaced_run_identity(tmp_path: Path) -> No
     assert result.outcome == "noop"
     log = "".join(path.read_text() for path in (tmp_path / "logs").glob("*.log"))
     assert "stale lock taken over: displaced-run" in log
+
+
+def test_hour_seal_and_release_build_progress_is_mirrored_to_the_run_log(
+    tmp_path: Path,
+) -> None:
+    source_day = date(2026, 8, 7)
+    now = datetime(2026, 8, 8, 0, 1, tzinfo=UTC)
+    store = FactStore(tmp_path, clock=lambda: now)
+    for hour in _hours(source_day)[:-1]:
+        index = RawHourIndex(hour, (), raw_commit_sha256(()), 1)
+        store.commit_hour(project_hour(index, ()))
+    events: list[str] = []
+
+    result = PipelineDriver(
+        tmp_path,
+        source=EmptySource(),
+        clock=lambda: now,
+    ).run(heal_days=2, progress_callback=events.append)
+
+    assert result.exit_code == 0
+    assert events[0] == "heal plan: days=2 missing_settled_hours=1"
+    assert events[1].startswith("healed 2026-08-07T23 bundles=0 rows=0 bytes=")
+    assert events[2].startswith("sealed 2026-08-07 rows=0 elapsed=")
+    assert events[3].startswith("release build started: release_id=2026-08-07-")
+    assert events[4].startswith("release build done: release_id=2026-08-07-")
+    assert "reused=false" in events[4]
+    log = "".join(path.read_text() for path in (tmp_path / "logs").glob("*.log"))
+    for event in events:
+        assert event in log
+
+
+def test_status_exposes_current_run_after_each_hour_commit_and_clears_at_end(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 7, 2, 1, tzinfo=UTC)
+    source = StatusObservingSource(tmp_path)
+
+    result = PipelineDriver(
+        tmp_path,
+        source=source,
+        clock=lambda: now,
+    ).run(heal_days=1)
+
+    assert source.observed_status is not None
+    current = source.observed_status["current_run"]
+    assert current == {
+        "run_id": result.run_id,
+        "phase": "heal",
+        "current_hour": "2026-08-07T00",
+        "hours_done": 1,
+        "hours_planned": 2,
+        "started_at": "2026-08-07T02:01:00Z",
+    }
+    final_status = json.loads((tmp_path / "status.json").read_bytes())
+    assert final_status["current_run"] is None
+    assert final_status["last_run"]["run_id"] == result.run_id
+
+
+def test_hour_progress_marks_an_identical_commit_reused(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 7, 1, 1, tzinfo=UTC)
+
+    def install_identical_commit(seam: str, stage: Path) -> None:
+        if seam != "before_hour_promote":
+            return
+        final_name = stage.name.removeprefix(".").split(".tmp-", 1)[0]
+        shutil.copytree(stage, stage.parent / final_name)
+
+    events: list[str] = []
+    result = PipelineDriver(
+        tmp_path,
+        source=EmptySource(),
+        clock=lambda: now,
+        fact_fault_injector=install_identical_commit,
+    ).run(heal_days=1, progress_callback=events.append)
+
+    assert result.exit_code == 0
+    healed = next(event for event in events if event.startswith("healed "))
+    assert healed.endswith("reused [1/1]")

@@ -30,7 +30,9 @@ from bpp_analyzer.release import (
     RELEASE_ID_PATTERN,
     ReleaseBuilder,
     ReleasePublisher,
+    compute_release_id,
     local_newest_release_id,
+    window_seals,
 )
 
 
@@ -68,6 +70,7 @@ class RunSummary:
 @dataclass(slots=True)
 class _RunProgress:
     hours_ingested: int = 0
+    hours_planned: int = 0
     days_sealed: int = 0
     days_abandoned: int = 0
     failures: list[dict[str, str]] = field(default_factory=list)
@@ -122,6 +125,8 @@ class PipelineDriver:
         anchor_day: date | str | None = None,
         publish: bool = True,
         dry_run: bool = False,
+        progress_callback: Callable[[str], None] | None = None,
+        error_callback: Callable[[str], None] | None = None,
     ) -> RunSummary:
         if not isinstance(heal_days, int) or isinstance(heal_days, bool) or heal_days < 1:
             raise ValueError("heal_days must be a positive integer")
@@ -188,6 +193,40 @@ class PipelineDriver:
                 run_log.write("run started")
                 if lock.stale_run_id is not None:
                     run_log.write(f"stale lock taken over: {lock.stale_run_id}")
+                def report(message: str) -> None:
+                    run_log.write(message)
+                    if progress_callback is not None:
+                        progress_callback(message)
+
+                def report_error(message: str) -> None:
+                    run_log.write(message)
+                    if error_callback is not None:
+                        error_callback(message)
+
+                def checkpoint(phase: str, current_hour: str | None) -> None:
+                    try:
+                        _write_current_status(
+                            self.data_root,
+                            store,
+                            run_id=run_id,
+                            phase=phase,
+                            current_hour=current_hour,
+                            hours_done=progress.hours_ingested,
+                            hours_planned=progress.hours_planned,
+                            started_at=now,
+                            now=_aware_utc(self.clock()),
+                            considered_days=healing_days(now, heal_days),
+                            published_pointer=published_pointer,
+                            ownership_check=lock.assert_owned,
+                        )
+                    except LockOwnershipLost:
+                        raise
+                    except BaseException as error:
+                        _try_log(
+                            run_log,
+                            f"live status refresh failed: {_error_reason(error)}",
+                        )
+
                 summary = self._heal(
                     store,
                     lock,
@@ -197,6 +236,9 @@ class PipelineDriver:
                     started_monotonic=started_monotonic,
                     progress=progress,
                     log=run_log.write,
+                    report=report,
+                    report_error=report_error,
+                    checkpoint=checkpoint,
                 )
                 build_started = time.monotonic()
                 seals = store.seals()
@@ -205,18 +247,29 @@ class PipelineDriver:
                 )
                 local = None
                 if selected_anchor is not None:
-                    local = ReleaseBuilder(
+                    builder = ReleaseBuilder(
                         self.data_root,
                         store=store,
                         memory_limit=self.duckdb_memory_limit,
                         threads=self.duckdb_threads,
                         ownership_check=lock.assert_owned,
                         fault_injector=self.release_fault_injector,
-                    ).build(selected_anchor, seals)
-                    if local.reused:
-                        run_log.write(f"release reused: {local.release_id}")
-                    else:
-                        run_log.write(f"release built: {local.release_id}")
+                    )
+                    release_id = compute_release_id(
+                        selected_anchor,
+                        window_seals(seals, selected_anchor),
+                        builder_code_version=builder.builder_code_version,
+                        policy_version=builder.policy_version,
+                    )
+                    checkpoint("build", None)
+                    report(f"release build started: release_id={release_id}")
+                    local = builder.build(selected_anchor, seals)
+                    report(
+                        f"release build done: release_id={local.release_id} "
+                        f"elapsed={_format_elapsed(time.monotonic() - build_started)} "
+                        f"reused={str(local.reused).lower()}"
+                    )
+                    if not local.reused:
                         summary = replace(
                             summary,
                             outcome="ok" if summary.outcome == "noop" else summary.outcome,
@@ -224,7 +277,15 @@ class PipelineDriver:
                         )
                 publish_started = time.monotonic()
                 if publisher is not None:
+                    checkpoint("publish", None)
+                    pointer_started = time.monotonic()
+                    report("publish pointer check started")
                     published_pointer = publisher.current_pointer()
+                    report(
+                        "publish pointer check done: published_release_id="
+                        f"{published_pointer.release_id if published_pointer else 'none'} "
+                        f"elapsed={_format_elapsed(time.monotonic() - pointer_started)}"
+                    )
                     hold = (self.data_root / "publish-hold.json").is_file()
                     if (
                         local is not None
@@ -235,16 +296,36 @@ class PipelineDriver:
                             or local.release_id != published_pointer.release_id
                         )
                     ):
+                        publish_action_started = time.monotonic()
+                        report(f"publish started: release_id={local.release_id}")
                         published = publisher.publish(
                             local,
                             current=published_pointer,
                         )
                         published_pointer = published.pointer
-                        run_log.write(f"release published: {local.release_id}")
+                        report(
+                            f"publish done: release_id={local.release_id} "
+                            f"uploaded={published.uploaded} skipped={published.skipped} "
+                            f"elapsed={_format_elapsed(time.monotonic() - publish_action_started)}"
+                        )
                         summary = replace(
                             summary,
                             outcome="ok" if summary.outcome == "noop" else summary.outcome,
                             release_published=local.release_id,
+                        )
+                    elif local is None:
+                        report("publish skipped: no local release")
+                    elif not publish:
+                        report(
+                            f"publish skipped: release_id={local.release_id} --no-publish"
+                        )
+                    elif hold:
+                        report(
+                            f"publish skipped: release_id={local.release_id} hold active"
+                        )
+                    else:
+                        report(
+                            f"publish skipped: release_id={local.release_id} already published"
                         )
                 if summary.exit_code == 0:
                     _prune_releases(
@@ -353,29 +434,56 @@ class PipelineDriver:
         started_monotonic: float,
         progress: _RunProgress,
         log: Callable[[str], None],
+        report: Callable[[str], None],
+        report_error: Callable[[str], None],
+        checkpoint: Callable[[str, str | None], None],
     ) -> RunSummary:
         heal_started = time.monotonic()
         progress.heal_started_monotonic = heal_started
 
-        for day in healing_days(now, heal_days):
-            lock.assert_owned()
+        days = healing_days(now, heal_days)
+        planned_by_day: dict[date, tuple[datetime, ...]] = {}
+        for day in days:
             if store.has_seal(day) or store.is_abandoned(day):
                 continue
-            missing = store.missing_hours(day)
+            planned_by_day[day] = settled_missing_hours(
+                day,
+                now,
+                store.missing_hours(day),
+                settle_lag=self.settle_lag,
+            )
+        hours_planned = sum(len(hours) for hours in planned_by_day.values())
+        progress.hours_planned = hours_planned
+        report(
+            f"heal plan: days={len(days)} "
+            f"missing_settled_hours={hours_planned}"
+        )
+
+        for day, planned_hours in planned_by_day.items():
+            lock.assert_owned()
+            day_started = time.monotonic()
             expired_reason: str | None = None
-            for hour in settled_missing_hours(
-                day, now, missing, settle_lag=self.settle_lag
-            ):
+            for hour in planned_hours:
                 lock.assert_owned()
                 try:
+                    hour_started = time.monotonic()
                     index = self.source.hour_index(hour)
                     projected = project_hour(index, self.source.stream(index))
-                    store.commit_hour(projected)
+                    commit = store.commit_hour(projected)
                     progress.hours_ingested += 1
                     progress.changed = True
+                    checkpoint("heal", commit.source_hour)
+                    reused = " reused" if commit.reused else ""
+                    report(
+                        f"healed {commit.source_hour} bundles={commit.bundle_count} "
+                        f"rows={sum(commit.row_counts.values())} "
+                        f"bytes={_format_bytes(sum(commit.file_bytes.values()))} "
+                        f"elapsed={_format_elapsed(time.monotonic() - hour_started)}"
+                        f"{reused} [{progress.hours_ingested}/{hours_planned}]"
+                    )
                 except HourExpired as error:
                     expired_reason = error.reason
-                    log(
+                    report_error(
                         f"source hour expired: {hour.strftime('%Y-%m-%dT%H')} "
                         f"({error.reason})"
                     )
@@ -388,7 +496,7 @@ class PipelineDriver:
                             "reason": str(getattr(error, "reason", type(error).__name__)),
                         }
                     )
-                    log(
+                    report_error(
                         f"source hour failed: {hour.strftime('%Y-%m-%dT%H')} "
                         f"({getattr(error, 'reason', type(error).__name__)})"
                     )
@@ -402,13 +510,23 @@ class PipelineDriver:
                 log(f"source day abandoned: {day.isoformat()} ({expired_reason})")
                 progress.days_abandoned += 1
                 progress.changed = True
+                checkpoint("heal", hour.strftime("%Y-%m-%dT%H"))
+                report(
+                    f"abandoned {day.isoformat()} missing={len(remaining)} "
+                    f"reason={expired_reason} "
+                    f"elapsed={_format_elapsed(time.monotonic() - day_started)}"
+                )
                 continue
             try:
                 if not store.missing_hours(day):
-                    store.seal_day(day)
-                    log(f"source day sealed: {day.isoformat()}")
+                    seal = store.seal_day(day)
                     progress.days_sealed += 1
                     progress.changed = True
+                    checkpoint("heal", f"{day.isoformat()}T23")
+                    report(
+                        f"sealed {day.isoformat()} rows={sum(seal.row_counts.values())} "
+                        f"elapsed={_format_elapsed(time.monotonic() - day_started)}"
+                    )
             except Exception as error:
                 progress.failures.append(
                     {
@@ -417,7 +535,7 @@ class PipelineDriver:
                         "reason": str(getattr(error, "reason", type(error).__name__)),
                     }
                 )
-                log(
+                report_error(
                     f"source day failed: {day.isoformat()} "
                     f"({getattr(error, 'reason', type(error).__name__)})"
                 )
@@ -441,6 +559,14 @@ class PipelineDriver:
             elapsed=time.monotonic() - started_monotonic,
             heal_seconds=time.monotonic() - heal_started,
         )
+
+
+def _format_bytes(value: int) -> str:
+    return f"{value / (1024 * 1024):.1f}MiB"
+
+
+def _format_elapsed(value: float) -> str:
+    return f"{max(round(value), 0)}s"
 
 
 def healing_days(now: datetime, count: int) -> tuple[date, ...]:
@@ -549,6 +675,7 @@ def build_status(
             "published_manifest_age_seconds": published_age,
         },
         "last_run": last_run.to_dict() if last_run is not None else None,
+        "current_run": None,
         "disk": {"free_bytes": shutil.disk_usage(disk_root).free},
         "peak_rss_bytes": peak_rss_bytes(),
     }
@@ -575,6 +702,56 @@ def read_status(data_root: str | Path) -> dict[str, Any]:
 def peak_rss_bytes() -> int:
     observed = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     return observed if sys.platform == "darwin" else observed * 1024
+
+
+def _write_current_status(
+    root: Path,
+    store: FactStore,
+    *,
+    run_id: str,
+    phase: str,
+    current_hour: str | None,
+    hours_done: int,
+    hours_planned: int,
+    started_at: datetime,
+    now: datetime,
+    considered_days: tuple[date, ...],
+    published_pointer: PublishedPointer | None,
+    ownership_check: Callable[[], None],
+) -> None:
+    previous: dict[str, Any] = {}
+    try:
+        observed = json.loads((root / "status.json").read_bytes())
+        if isinstance(observed, dict):
+            previous = observed
+    except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError):
+        pass
+
+    status = build_status(
+        root,
+        store,
+        None,
+        now=now,
+        considered_days=considered_days,
+        published_pointer=published_pointer,
+    )
+    status["last_run"] = previous.get("last_run")
+    if published_pointer is None and isinstance(previous.get("release"), dict):
+        for field in (
+            "published_release_id",
+            "published_window_end",
+            "published_manifest_age_seconds",
+        ):
+            status["release"][field] = previous["release"].get(field)
+    status["current_run"] = {
+        "run_id": run_id,
+        "phase": phase,
+        "current_hour": current_hour,
+        "hours_done": hours_done,
+        "hours_planned": hours_planned,
+        "started_at": _aware_utc(started_at).isoformat().replace("+00:00", "Z"),
+    }
+    _write_status(root, status, ownership_check)
 
 
 def _error_reason(error: BaseException) -> str:
@@ -745,6 +922,7 @@ def _error_status(
             "published_manifest_age_seconds": published_age,
         },
         "last_run": summary.to_dict(),
+        "current_run": None,
         "disk": {"free_bytes": shutil.disk_usage(_existing_ancestor(root)).free},
         "peak_rss_bytes": peak_rss_bytes(),
     }

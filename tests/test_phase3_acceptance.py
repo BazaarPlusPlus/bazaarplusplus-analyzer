@@ -53,9 +53,24 @@ def test_acceptance_1_and_8_second_run_is_a_cheap_nonmutating_noop(
         clock=lambda: run_now,
         duckdb_threads=4,
     )
-    first = driver.run(heal_days=1, anchor_day="2026-08-07")
+    first_events: list[str] = []
+    first = driver.run(
+        heal_days=1,
+        anchor_day="2026-08-07",
+        progress_callback=first_events.append,
+    )
     assert first.exit_code == 0
     assert first.release_published == first.release_built
+    assert first_events[-4] == "publish pointer check started"
+    assert first_events[-3].startswith(
+        "publish pointer check done: published_release_id=none elapsed="
+    )
+    assert first_events[-2] == (
+        f"publish started: release_id={first.release_published}"
+    )
+    assert first_events[-1].startswith(
+        f"publish done: release_id={first.release_published} uploaded="
+    )
     assert objects.requests[-1] == StoreRequest("get", POINTER_KEY)
     before = _snapshot(root / "facts", root / "releases")
 
@@ -69,7 +84,12 @@ def test_acceptance_1_and_8_second_run_is_a_cheap_nonmutating_noop(
     monkeypatch.setattr(FactStore, "hour_paths", no_parquet_paths)
     objects.clear_requests()
 
-    second = driver.run(heal_days=1, anchor_day="2026-08-07")
+    second_events: list[str] = []
+    second = driver.run(
+        heal_days=1,
+        anchor_day="2026-08-07",
+        progress_callback=second_events.append,
+    )
 
     assert second.exit_code == 0
     assert second.outcome == "noop"
@@ -77,6 +97,10 @@ def test_acceptance_1_and_8_second_run_is_a_cheap_nonmutating_noop(
     assert [(item.operation, item.key) for item in objects.requests] == [
         ("get", POINTER_KEY)
     ]
+    assert not any(event.startswith("healed ") for event in second_events)
+    assert second_events[-1] == (
+        f"publish skipped: release_id={first.release_published} already published"
+    )
     status = json.loads((root / "status.json").read_bytes())
     assert status["release"]["published_release_id"] == first.release_published
     assert status["release"]["published_window_end"] == "2026-08-07"

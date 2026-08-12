@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from functools import partial
 import json
 from pathlib import Path
 
 from click.testing import CliRunner
 
 import bpp_analyzer.cli as cli
-from bpp_analyzer.bundle_source import RetryableSourceError
+from bpp_analyzer.bundle_source import RawHourIndex, RetryableSourceError, raw_commit_sha256
 from bpp_analyzer.config import Config
+from bpp_analyzer.driver import PipelineDriver
 from bpp_analyzer.locking import DirectoryLock
 from bpp_analyzer.object_store import LocalObjectStore
+from bpp_analyzer.release import ReleaseBuilder, ReleasePublisher
+from tests.release_fixtures import sealed_store
 
 
 class FailedContextSource:
@@ -27,6 +32,28 @@ class FailedContextSource:
 
     def stream(self, _index):
         raise AssertionError("A failed index must never be streamed")
+
+
+class EmptyContextSource:
+    def __init__(self, **_kwargs) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args) -> None:
+        pass
+
+    def hour_index(self, source_hour: datetime) -> RawHourIndex:
+        return RawHourIndex(source_hour, (), raw_commit_sha256(()), 1)
+
+    def stream(self, _index):
+        return iter(())
+
+
+class NeverContextSource(EmptyContextSource):
+    def hour_index(self, _source_hour):
+        raise AssertionError("Sealed fixture days must not reach the Bundle Server")
 
 
 def _config(root: Path) -> Config:
@@ -75,3 +102,156 @@ def test_cli_dry_run_uses_only_the_fake_pointer_get(
         ("get", "analyzer-v5/manifest.json")
     ]
     assert not data_root.exists()
+
+
+def test_cli_run_streams_the_heal_plan_and_zero_row_hour_progress(
+    tmp_path: Path, monkeypatch
+) -> None:
+    now = datetime(2026, 8, 7, 1, 1, tzinfo=UTC)
+    monkeypatch.setattr(cli, "load_config", lambda **_kwargs: _config(tmp_path))
+    monkeypatch.setattr(cli, "BundleSource", EmptyContextSource)
+    monkeypatch.setattr(
+        cli,
+        "PipelineDriver",
+        partial(PipelineDriver, clock=lambda: now),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_object_store",
+        lambda _config: LocalObjectStore(tmp_path / "fake-r2"),
+    )
+
+    result = CliRunner().invoke(cli.main, ["run", "--heal-days", "1"])
+
+    assert result.exit_code == 0
+    lines = result.output.splitlines()
+    assert lines[0] == "heal plan: days=1 missing_settled_hours=1"
+    assert lines[1].startswith(
+        "healed 2026-08-07T00 bundles=0 rows=0 bytes="
+    )
+    assert lines[1].endswith("[1/1]")
+    assert lines[-1] == "ok: 1 hours ingested, 0 days sealed, 0 days abandoned"
+
+
+def test_cli_run_quiet_suppresses_progress_but_keeps_the_final_summary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    now = datetime(2026, 8, 7, 1, 1, tzinfo=UTC)
+    monkeypatch.setattr(cli, "load_config", lambda **_kwargs: _config(tmp_path))
+    monkeypatch.setattr(cli, "BundleSource", EmptyContextSource)
+    monkeypatch.setattr(
+        cli,
+        "PipelineDriver",
+        partial(PipelineDriver, clock=lambda: now),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_object_store",
+        lambda _config: LocalObjectStore(tmp_path / "fake-r2"),
+    )
+
+    result = CliRunner().invoke(
+        cli.main,
+        ["run", "--heal-days", "1", "--quiet"],
+    )
+
+    assert result.exit_code == 0
+    assert result.output.splitlines() == [
+        "ok: 1 hours ingested, 0 days sealed, 0 days abandoned"
+    ]
+
+
+def test_cli_noop_prints_no_per_hour_progress_and_uses_one_pointer_get(
+    tmp_path: Path, monkeypatch
+) -> None:
+    now = datetime(2026, 8, 7, 23, 59, tzinfo=UTC)
+    facts = sealed_store(tmp_path, 1)
+    local = ReleaseBuilder(tmp_path, store=facts).build(
+        "2026-08-07",
+        facts.seals(),
+    )
+    objects = LocalObjectStore(tmp_path / "fake-r2", clock=lambda: now)
+    ReleasePublisher(tmp_path, objects, clock=lambda: now).publish(local)
+    objects.clear_requests()
+    monkeypatch.setattr(cli, "load_config", lambda **_kwargs: _config(tmp_path))
+    monkeypatch.setattr(cli, "BundleSource", NeverContextSource)
+    monkeypatch.setattr(
+        cli,
+        "PipelineDriver",
+        partial(PipelineDriver, clock=lambda: now),
+    )
+    monkeypatch.setattr(cli, "_object_store", lambda _config: objects)
+
+    result = CliRunner().invoke(
+        cli.main,
+        ["run", "--heal-days", "1", "--anchor-day", "2026-08-07"],
+    )
+
+    assert result.exit_code == 0
+    assert not any(
+        line.startswith("healed ") for line in result.output.splitlines()
+    )
+    assert "already published" in result.output
+    assert [(request.operation, request.key) for request in objects.requests] == [
+        ("get", "analyzer-v5/manifest.json")
+    ]
+
+
+def test_cli_run_quiet_still_prints_retryable_hour_errors(
+    tmp_path: Path, monkeypatch
+) -> None:
+    now = datetime(2026, 8, 7, 1, 1, tzinfo=UTC)
+    monkeypatch.setattr(cli, "load_config", lambda **_kwargs: _config(tmp_path))
+    monkeypatch.setattr(cli, "BundleSource", FailedContextSource)
+    monkeypatch.setattr(
+        cli,
+        "PipelineDriver",
+        partial(PipelineDriver, clock=lambda: now),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_object_store",
+        lambda _config: LocalObjectStore(tmp_path / "fake-r2"),
+    )
+
+    result = CliRunner().invoke(
+        cli.main,
+        ["run", "--heal-days", "1", "--quiet"],
+    )
+
+    assert result.exit_code == 4
+    assert result.output.splitlines() == [
+        "source hour failed: 2026-08-07T00 (fixture_retryable)",
+        "partial: 0 hours ingested, 0 days sealed, 0 days abandoned",
+    ]
+
+
+def test_cli_status_text_shows_live_current_run_progress(
+    tmp_path: Path, monkeypatch
+) -> None:
+    status = {
+        "facts": {"newest_sealed_day": None, "abandoned_days": []},
+        "current_run": {
+            "run_id": "live-run",
+            "phase": "heal",
+            "current_hour": "2026-08-07T00",
+            "hours_done": 1,
+            "hours_planned": 2,
+            "started_at": "2026-08-07T02:01:00Z",
+        },
+        "last_run": {"outcome": "ok"},
+    }
+    (tmp_path / "status.json").write_text(json.dumps(status))
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        lambda **_kwargs: Config(tmp_path, None, None),
+    )
+
+    result = CliRunner().invoke(cli.main, ["status"])
+
+    assert result.exit_code == 0
+    assert (
+        "current run: live-run phase=heal hour=2026-08-07T00 "
+        "hours=1/2 started=2026-08-07T02:01:00Z"
+    ) in result.output

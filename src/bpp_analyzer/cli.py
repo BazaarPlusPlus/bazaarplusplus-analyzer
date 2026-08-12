@@ -32,11 +32,13 @@ def main() -> None:
 @click.option("--anchor-day", type=str)
 @click.option("--no-publish", is_flag=True, help="Build locally without publishing.")
 @click.option("--dry-run", is_flag=True, help="Report without writing local state.")
+@click.option("--quiet", is_flag=True, help="Suppress progress; keep the final summary.")
 def run_command(
     heal_days: int,
     anchor_day: str | None,
     no_publish: bool,
     dry_run: bool,
+    quiet: bool,
 ) -> None:
     """Heal Source Hours, seal complete Source Days, then report."""
     try:
@@ -88,6 +90,8 @@ def run_command(
                 heal_days=heal_days,
                 anchor_day=anchor_day,
                 publish=not no_publish,
+                progress_callback=None if quiet else click.echo,
+                error_callback=lambda message: click.echo(message, err=True),
             )
         click.echo(
             f"{summary.outcome}: {summary.hours_ingested} hours ingested, "
@@ -124,6 +128,15 @@ def status_command(json_output: bool) -> None:
     last = value.get("last_run")
     click.echo(f"newest sealed day: {facts.get('newest_sealed_day') or '-'}")
     click.echo(f"abandoned days: {len(facts.get('abandoned_days', []))}")
+    current = value.get("current_run")
+    if isinstance(current, dict):
+        click.echo(
+            f"current run: {current.get('run_id') or '-'} "
+            f"phase={current.get('phase') or '-'} "
+            f"hour={current.get('current_hour') or '-'} "
+            f"hours={current.get('hours_done', 0)}/{current.get('hours_planned', 0)} "
+            f"started={current.get('started_at') or '-'}"
+        )
     click.echo(f"last outcome: {last.get('outcome') if isinstance(last, dict) else '-'}")
 
 
