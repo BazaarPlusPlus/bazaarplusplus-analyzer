@@ -9,18 +9,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from bppanalyzer.bundle_source import (
-    Bundle,
     BundleRef,
     RawHourIndex,
+    admit_bundle,
     raw_commit_sha256,
 )
-from bppanalyzer.driver import (
-    PipelineDriver,
-    healing_days,
-    is_hour_settled,
-    peak_rss_bytes,
-)
+from bppanalyzer.driver import PipelineDriver
 from bppanalyzer.fact_store import FactStore
+from bppanalyzer.hour_intake import healing_days, is_hour_settled
+from bppanalyzer.operational_evidence import peak_rss_bytes
 from bppanalyzer.projection import HourProjection, project_hour, table_schemas
 from tests.bundle_fixtures import bundle_bytes, payload
 
@@ -48,12 +45,7 @@ class BusyHourSource:
     def stream(self, index: RawHourIndex):
         for ref in index.items:
             content = bundle_bytes(ref.bundle_id, run_payload=self.run_payload)
-            yield Bundle(
-                ref,
-                content,
-                hashlib.sha256(content).hexdigest(),
-                len(content),
-            )
+            yield admit_bundle(ref, content)
 
 
 def _measure_busy_hour(root: str, results) -> None:

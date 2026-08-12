@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import ExitStack
@@ -55,6 +56,9 @@ class HourCommit:
     file_sha256s: Mapping[str, str]
     file_bytes: Mapping[str, int]
     reused: bool
+    batch_generation_seconds: float = 0.0
+    parquet_write_seconds: float = 0.0
+    fact_finalize_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +106,7 @@ class FactStore:
         self._fault = fault_injector or (lambda _seam, _path: None)
 
     def commit_hour(self, projected: HourProjection) -> HourCommit:
+        commit_started = time.perf_counter()
         self._ownership_check()
         hour = parse_source_hour(projected.source_hour)
         hour_key = hour.strftime("%Y-%m-%dT%H")
@@ -124,6 +129,8 @@ class FactStore:
             file_hashes: dict[str, str] = {}
             file_bytes: dict[str, int] = {}
             row_counts = {name: 0 for name in TABLES}
+            generation_seconds = 0.0
+            parquet_seconds = 0.0
             with ExitStack() as writer_stack:
                 writers = {
                     name: writer_stack.enter_context(
@@ -139,14 +146,23 @@ class FactStore:
                     )
                     for name in TABLES
                 }
-                for name, batch in projected.iter_batches():
+                batches = projected.iter_batches()
+                while True:
+                    generation_started = time.perf_counter()
+                    try:
+                        name, batch = next(batches)
+                    except StopIteration:
+                        break
+                    generation_seconds += time.perf_counter() - generation_started
                     self._ownership_check()
                     if name not in writers:
                         raise FactCorrupt(f"Hourly projection emitted unknown table {name}")
                     if batch.schema != schemas[name]:
                         raise FactCorrupt(f"Hourly {name} schema differs from the owned schema")
                     self._require_partition_columns(batch, name, hour_key, day_key)
+                    write_started = time.perf_counter()
                     writers[name].write_batch(batch, row_group_size=batch.num_rows)
+                    parquet_seconds += time.perf_counter() - write_started
                     row_counts[name] += batch.num_rows
 
             for name in TABLES:
@@ -192,11 +208,38 @@ class FactStore:
                 if existing != commit_bytes:
                     raise FactConflict(f"Hourly Fact Partition commit conflict: {hour_key}")
                 committed = self._read_hour(hour, deep=True)
-                return replace(committed, reused=True)
+                return replace(
+                    committed,
+                    reused=True,
+                    batch_generation_seconds=round(generation_seconds, 6),
+                    parquet_write_seconds=round(parquet_seconds, 6),
+                    fact_finalize_seconds=round(
+                        max(
+                            time.perf_counter()
+                            - commit_started
+                            - generation_seconds
+                            - parquet_seconds,
+                            0.0,
+                        ),
+                        6,
+                    ),
+                )
 
             os.rename(stage, final)
             _fsync_directory(self._hourly)
-            return replace(self._read_hour(hour, deep=True), reused=False)
+            return replace(
+                self._read_hour(hour, deep=True),
+                reused=False,
+                batch_generation_seconds=round(generation_seconds, 6),
+                parquet_write_seconds=round(parquet_seconds, 6),
+                fact_finalize_seconds=round(
+                    max(
+                        time.perf_counter() - commit_started - generation_seconds - parquet_seconds,
+                        0.0,
+                    ),
+                    6,
+                ),
+            )
         finally:
             if stage.exists():
                 shutil.rmtree(stage, ignore_errors=True)

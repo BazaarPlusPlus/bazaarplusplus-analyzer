@@ -62,6 +62,7 @@ def _retrying_source(
         client=httpx.Client(transport=server),
         clock=lambda: datetime(2026, 8, 11, tzinfo=UTC),
         sleep=backoffs.append,
+        jitter=lambda delay: delay,
     )
 
 
@@ -83,6 +84,58 @@ def test_listing_succeeds_after_two_transient_503_responses() -> None:
     assert index.items == ()
     assert attempts == 3
     assert backoffs == [1.0, 2.0]
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "expected_delay"),
+    [
+        ("5", 5.0),
+        ("Tue, 11 Aug 2026 00:00:05 GMT", 5.0),
+        ("120", 60.0),
+    ],
+)
+def test_retry_after_delays_the_next_listing_attempt(
+    retry_after: str, expected_delay: float
+) -> None:
+    attempts = 0
+    backoffs: list[float] = []
+
+    def server(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(429, headers={"Retry-After": retry_after})
+        return httpx.Response(200, json=_empty_page())
+
+    source = _retrying_source(httpx.MockTransport(server), backoffs)
+
+    assert source.hour_index(HOUR).items == ()
+    assert attempts == 2
+    assert backoffs == [expected_delay]
+
+
+def test_default_retry_backoff_uses_bounded_jitter() -> None:
+    attempts = 0
+    backoffs: list[float] = []
+
+    def server(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, json=_empty_page())
+
+    source = BundleSource(
+        api_base_url="https://api.invalid",
+        sync_token="test-token",
+        client=httpx.Client(transport=httpx.MockTransport(server)),
+        clock=lambda: datetime(2026, 8, 11, tzinfo=UTC),
+        sleep=backoffs.append,
+    )
+
+    assert source.hour_index(HOUR).items == ()
+    assert len(backoffs) == 1
+    assert 0.5 <= backoffs[0] <= 1.5
 
 
 @pytest.mark.parametrize("failure", ["transport", "retryable_body"])
@@ -135,8 +188,8 @@ def test_download_succeeds_after_a_transport_error() -> None:
 
     assert download_attempts == 2
     assert backoffs == [1.0]
-    assert downloaded[0].content == content
-    assert downloaded[0].validation_error is None
+    assert downloaded[0].bytes == len(content)
+    assert downloaded[0].manifest["bundle_id"] == "bundle-a"
 
 
 def test_window_expired_410_is_never_retried() -> None:
@@ -268,7 +321,7 @@ def test_download_retries_every_declared_transient_http_response(
 
     assert download_attempts == 2
     assert backoffs == [1.0]
-    assert downloaded[0].content == content
+    assert downloaded[0].bytes == len(content)
 
 
 @pytest.mark.parametrize(
@@ -500,8 +553,8 @@ def test_expired_download_capability_reenumerates_the_same_fixed_hour() -> None:
     assert enumerations == 2
     assert refreshed_attempts == 3
     assert backoffs == [1.0, 2.0]
-    assert downloaded[0].validation_error is None
-    assert downloaded[0].content == content
+    assert downloaded[0].bytes == len(content)
+    assert downloaded[0].manifest["bundle_id"] == "bundle-a"
 
 
 def test_download_url_refresh_is_bounded_to_one_reenumeration() -> None:
@@ -596,3 +649,72 @@ def test_stream_never_downloads_beyond_its_eight_bundle_lookahead() -> None:
     worker.join(2)
     assert len(result) == 1
     stream.close()
+
+
+def test_stream_stops_starting_downloads_after_a_fatal_bundle_failure() -> None:
+    contents = {f"bundle-{number:02d}": bundle_bytes(f"bundle-{number:02d}") for number in range(8)}
+    second_started = threading.Event()
+    release_second = threading.Event()
+    counter_lock = threading.Lock()
+    started = 0
+
+    def server(request: httpx.Request) -> httpx.Response:
+        nonlocal started
+        if request.url.host == "api.invalid":
+            return httpx.Response(
+                200,
+                json={
+                    "window": {
+                        "available_from_ms": int(HOUR.timestamp() * 1_000),
+                        "available_before_ms": int(HOUR.timestamp() * 1_000) + 3_600_000,
+                    },
+                    "items": [
+                        {
+                            "bundle_id": bundle_id,
+                            "available_at_ms": int(HOUR.timestamp() * 1_000) + number,
+                            "download_url": f"https://download.invalid/{bundle_id}",
+                            "download_expires_at_ms": int(HOUR.timestamp() * 1_000) + 60_000,
+                            "sha256": hashlib.sha256(content).hexdigest(),
+                            "bytes": len(content),
+                        }
+                        for number, (bundle_id, content) in enumerate(contents.items())
+                    ],
+                    "next_after": None,
+                },
+            )
+        with counter_lock:
+            started += 1
+            observed = started
+        if observed == 1:
+            return httpx.Response(404)
+        if observed == 2:
+            second_started.set()
+            assert release_second.wait(2)
+        bundle_id = request.url.path.removeprefix("/")
+        return httpx.Response(200, content=contents[bundle_id])
+
+    source = BundleSource(
+        api_base_url="https://api.invalid",
+        sync_token="test-token",
+        client=httpx.Client(transport=httpx.MockTransport(server)),
+        clock=lambda: datetime(2026, 8, 11, tzinfo=UTC),
+        download_concurrency=1,
+        lookahead=8,
+    )
+    errors: list[BaseException] = []
+
+    def consume() -> None:
+        try:
+            list(source.stream(source.hour_index(HOUR)))
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=consume)
+    worker.start()
+    assert second_started.wait(1)
+    release_second.set()
+    worker.join(2)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], SourceContractError)
+    assert started <= 2

@@ -1,19 +1,24 @@
+import hashlib
 import json
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+import httpx
 import pytest
 
 from bppanalyzer.bundle_source import (
-    Bundle,
     BundleRef,
+    BundleSource,
     HourExpired,
     RawHourIndex,
+    RetryableSourceError,
     raw_commit_sha256,
 )
-from bppanalyzer.driver import PipelineDriver, read_status
+from bppanalyzer.driver import PipelineDriver
 from bppanalyzer.object_store import LocalObjectStore
+from bppanalyzer.operational_evidence import read_status
 from bppanalyzer.publication import BUILDS_KEY, HEROES_KEY
+from tests.bundle_fixtures import bundle_bytes
 
 
 class NeverSource:
@@ -37,8 +42,8 @@ class InvalidBundleSource:
         )
         return RawHourIndex(source_hour, (item,), raw_commit_sha256((item,)), 1)
 
-    def stream(self, index: RawHourIndex):
-        yield Bundle(index.items[0], None, None, 10, "bundle_sha256_mismatch")
+    def stream(self, _index: RawHourIndex):
+        raise RetryableSourceError("bundle_validation_failed", "fixture Bundle validation failed")
 
 
 class ExpiredSource:
@@ -138,6 +143,14 @@ def test_driver_publishes_exactly_two_objects_and_records_the_structured_run_rep
             "expected_bundles": 0,
             "succeeded_bundles": 0,
             "failed_bundles": 0,
+            "listing_pages": 0,
+            "listing_requests": 0,
+            "listing_retries": 0,
+            "download_attempts": 0,
+            "download_retries": 0,
+            "downloaded_bytes": 0,
+            "download_latency_ms_p50": None,
+            "download_latency_ms_p95": None,
         },
         "facts": {
             "raw_runs": 7,
@@ -223,11 +236,111 @@ def test_failed_bundle_is_reported_and_its_source_hour_remains_incomplete(
         "expected_bundles": 1,
         "succeeded_bundles": 0,
         "failed_bundles": 1,
+        "listing_pages": 1,
+        "listing_requests": 0,
+        "listing_retries": 0,
+        "download_attempts": 0,
+        "download_retries": 0,
+        "downloaded_bytes": 0,
+        "download_latency_ms_p50": None,
+        "download_latency_ms_p95": None,
     }
     assert summary.report["window"] is None
     assert not (tmp_path / "facts/hourly/source_hour=2026-08-07T00").exists()
     status = json.loads((tmp_path / "status.json").read_bytes())
     assert "2026-08-07T00" in status["facts"]["incomplete_days"][0]["missing_hours"]
+
+
+def test_run_summary_records_low_cardinality_source_performance(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 7, 1, 1, tzinfo=UTC)
+    content = bundle_bytes("bundle-a")
+    download_attempts = 0
+    sleeps: list[float] = []
+
+    def server(request: httpx.Request) -> httpx.Response:
+        nonlocal download_attempts
+        if request.url.host == "api.invalid":
+            timestamp = int(datetime(2026, 8, 7, tzinfo=UTC).timestamp() * 1_000)
+            return httpx.Response(
+                200,
+                json={
+                    "window": {
+                        "available_from_ms": timestamp,
+                        "available_before_ms": timestamp + 3_600_000,
+                    },
+                    "items": [
+                        {
+                            "bundle_id": "bundle-a",
+                            "available_at_ms": timestamp,
+                            "download_url": "https://download.invalid/bundle-a",
+                            "download_expires_at_ms": timestamp + 60_000,
+                            "sha256": hashlib.sha256(content).hexdigest(),
+                            "bytes": len(content),
+                        }
+                    ],
+                    "next_after": None,
+                },
+            )
+        download_attempts += 1
+        if download_attempts == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, content=content)
+
+    source = BundleSource(
+        api_base_url="https://api.invalid",
+        sync_token="test-token",
+        client=httpx.Client(transport=httpx.MockTransport(server)),
+        clock=lambda: now,
+        sleep=sleeps.append,
+        jitter=lambda delay: delay,
+    )
+
+    summary = PipelineDriver(tmp_path, source=source, clock=lambda: now).run(heal_days=1)
+
+    downloads = summary.report["downloads"]
+    assert {
+        key: downloads[key]
+        for key in (
+            "expected_bundles",
+            "succeeded_bundles",
+            "failed_bundles",
+            "listing_pages",
+            "listing_requests",
+            "listing_retries",
+            "download_attempts",
+            "download_retries",
+            "downloaded_bytes",
+        )
+    } == {
+        "expected_bundles": 1,
+        "succeeded_bundles": 1,
+        "failed_bundles": 0,
+        "listing_pages": 1,
+        "listing_requests": 1,
+        "listing_retries": 0,
+        "download_attempts": 2,
+        "download_retries": 1,
+        "downloaded_bytes": len(content),
+    }
+    assert isinstance(downloads["download_latency_ms_p50"], float)
+    assert isinstance(downloads["download_latency_ms_p95"], float)
+    assert 0 <= downloads["download_latency_ms_p50"] <= downloads["download_latency_ms_p95"]
+    assert sleeps == [1.0]
+    assert summary.timings["retry_sleep_seconds"] == 1.0
+    for name in (
+        "source_index_seconds",
+        "source_ingest_seconds",
+        "download_wait_seconds",
+        "batch_generation_seconds",
+        "projection_seconds",
+        "parquet_write_seconds",
+        "fact_finalize_seconds",
+    ):
+        assert summary.timings[name] >= 0
+    status = json.loads((tmp_path / "status.json").read_bytes())
+    assert status["last_run"]["timings"] == summary.timings
+    log = "".join(path.read_text() for path in (tmp_path / "logs").glob("*.log"))
+    assert 'performance report: {"downloads":' in log
 
 
 def test_no_publish_writes_valid_local_snapshots_without_object_store_calls(

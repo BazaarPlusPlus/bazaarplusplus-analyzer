@@ -19,6 +19,12 @@ latency-bound, increasing download concurrency from 4 to 8 approximately
 halved collection time. Concurrency 64 produced no observed server-side
 pushback when the HTTP keepalive pool was sized to match.
 
+Transient collection failures use bounded jittered backoff. A valid
+`Retry-After` response can extend the next delay up to 60 seconds. Once a fatal
+Bundle failure is observed, queued downloads that have not started are
+cancelled; already-running requests are allowed to finish before the Source
+Hour fails without a commit.
+
 ## Local fact storage
 
 Busy hours produce roughly 17–22 MiB of Parquet, dominated by Battle Cards.
@@ -36,6 +42,19 @@ baseline and produced 23 Parquet row groups. A production busy-hour heal with
 734,544 rows peaked at 0.65 GiB for the whole process, below the 1 GiB hourly
 ingest limit.
 
+After Run performance instrumentation was added, the current 2,500-Bundle,
+250,000-card acceptance fixture completed in 3.10 seconds, peaked about 148 MiB
+above its fresh-process baseline, and kept whole-process RSS near 241 MiB.
+
 ## Consumer snapshot size
 
 The two current snapshot sizes have not yet been measured in production.
+
+## Performance evidence
+
+Each Run Report records low-cardinality collection totals: listing pages and
+requests, listing/download retries, download attempts and bytes, and p50/p95
+attempt latency. Run timings separate source indexing, download waiting,
+projection, Parquet writing, fact finalization, and each product's build, local
+save, and publication stages. This is diagnostic evidence rather than a
+portable service-level guarantee.

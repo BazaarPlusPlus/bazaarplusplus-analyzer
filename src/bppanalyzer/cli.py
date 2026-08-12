@@ -7,10 +7,11 @@ import click
 
 from bppanalyzer.bundle_source import BundleSource, RawHourIndex
 from bppanalyzer.config import ConfigurationError, load_config
-from bppanalyzer.driver import PipelineDriver, read_status
+from bppanalyzer.driver import PipelineDriver
 from bppanalyzer.fact_store import FactStore, FactStoreError, parse_source_day
 from bppanalyzer.locking import LockHeld, LockOwnershipLost
 from bppanalyzer.object_store import ObjectStoreError, R2ObjectStore
+from bppanalyzer.operational_evidence import read_status
 from bppanalyzer.publication import ContractViolation, PublicationError, validate_snapshot
 
 

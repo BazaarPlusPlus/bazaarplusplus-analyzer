@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import math
+import random
 import re
 import threading
 import time
@@ -9,6 +11,7 @@ from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from typing import Any, Self, TypeVar
 
 import httpx
@@ -22,16 +25,24 @@ MAX_SCREENSHOT_BYTES = 1_048_576
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 RETRY_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
+MAX_RETRY_AFTER_SECONDS = 60.0
 
 _T = TypeVar("_T")
+
+
+def _jittered_delay(delay: float) -> float:
+    return random.uniform(delay * 0.5, delay * 1.5)
 
 
 class BundleSourceError(RuntimeError):
     """A safe, classified Bundle Server or Bundle contract failure."""
 
-    def __init__(self, reason: str, message: str) -> None:
+    def __init__(
+        self, reason: str, message: str, *, retry_after_seconds: float | None = None
+    ) -> None:
         super().__init__(message)
         self.reason = reason
+        self.retry_after_seconds = retry_after_seconds
 
 
 class HourExpired(BundleSourceError):
@@ -54,6 +65,19 @@ class _InvalidDownload(BundleSourceError):
     def __init__(self, reason: str, message: str, observed_bytes: int) -> None:
         super().__init__(reason, message)
         self.observed_bytes = observed_bytes
+
+
+@dataclass(frozen=True, slots=True)
+class SourcePerformance:
+    listing_requests: int
+    listing_retries: int
+    download_attempts: int
+    download_retries: int
+    downloaded_bytes: int
+    download_wait_seconds: float
+    retry_sleep_seconds: float
+    download_latency_ms_p50: float | None
+    download_latency_ms_p95: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,13 +124,27 @@ class RawHourIndex:
 
 @dataclass(frozen=True, slots=True)
 class Bundle:
-    """One in-memory download, either valid or explicitly quarantinable."""
+    """One admitted in-memory Bundle ready for projection."""
 
     ref: BundleRef
-    content: bytes | None
-    sha256: str | None
+    sha256: str
     bytes: int
-    validation_error: str | None = None
+    manifest: Mapping[str, Any]
+    run_content: bytes
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.sha256, str)
+            or _SHA256.fullmatch(self.sha256) is None
+            or not isinstance(self.bytes, int)
+            or isinstance(self.bytes, bool)
+            or self.bytes < 1
+        ):
+            raise ValueError("Admitted Bundle digest and byte count are required")
+        if not isinstance(self.manifest, Mapping) or not isinstance(self.run_content, bytes):
+            raise TypeError("Admitted Bundle manifest and Run content are required")
+        if not self.run_content:
+            raise ValueError("Admitted Bundle Run content is required")
 
 
 class BundleSource:
@@ -124,6 +162,7 @@ class BundleSource:
         lookahead: int = 8,
         page_limit: int = 200,
         sleep: Callable[[float], None] = time.sleep,
+        jitter: Callable[[float], float] = _jittered_delay,
     ) -> None:
         if not api_base_url or not sync_token:
             raise ValueError("Bundle Server URL and sync token are required")
@@ -148,7 +187,17 @@ class BundleSource:
         self._lookahead = lookahead
         self._page_limit = page_limit
         self._sleep = sleep
+        self._jitter = jitter
         self._refresh_lock = threading.Lock()
+        self._performance_lock = threading.Lock()
+        self._listing_requests = 0
+        self._listing_retries = 0
+        self._download_attempts = 0
+        self._download_retries = 0
+        self._downloaded_bytes = 0
+        self._download_wait_seconds = 0.0
+        self._retry_sleep_seconds = 0.0
+        self._download_latencies_ms: list[float] = []
 
     def close(self) -> None:
         if self._owns_client:
@@ -159,6 +208,32 @@ class BundleSource:
 
     def __exit__(self, *_args: object) -> None:
         self.close()
+
+    def performance_snapshot(self, *, reset: bool = False) -> SourcePerformance:
+        """Return low-cardinality collection measurements for one Run."""
+        with self._performance_lock:
+            latencies = tuple(self._download_latencies_ms)
+            value = SourcePerformance(
+                listing_requests=self._listing_requests,
+                listing_retries=self._listing_retries,
+                download_attempts=self._download_attempts,
+                download_retries=self._download_retries,
+                downloaded_bytes=self._downloaded_bytes,
+                download_wait_seconds=round(self._download_wait_seconds, 6),
+                retry_sleep_seconds=round(self._retry_sleep_seconds, 6),
+                download_latency_ms_p50=_percentile(latencies, 0.50),
+                download_latency_ms_p95=_percentile(latencies, 0.95),
+            )
+            if reset:
+                self._listing_requests = 0
+                self._listing_retries = 0
+                self._download_attempts = 0
+                self._download_retries = 0
+                self._downloaded_bytes = 0
+                self._download_wait_seconds = 0.0
+                self._retry_sleep_seconds = 0.0
+                self._download_latencies_ms.clear()
+            return value
 
     def hour_index(self, source_hour: datetime | str) -> RawHourIndex:
         hour = parse_source_hour(source_hour)
@@ -177,7 +252,7 @@ class BundleSource:
             if cursor is not None:
                 params["after_available_at_ms"] = str(cursor[0])
                 params["after_bundle_id"] = cursor[1]
-            response = self._retry(lambda: self._listing_request(params))
+            response = self._retry(lambda: self._listing_request(params), kind="listing")
             try:
                 payload = response.json()
             except ValueError as error:
@@ -231,6 +306,8 @@ class BundleSource:
         )
 
     def _listing_request(self, params: Mapping[str, str]) -> httpx.Response:
+        with self._performance_lock:
+            self._listing_requests += 1
         try:
             response = self._client.get(
                 f"{self._api_base_url}/bundles",
@@ -244,20 +321,36 @@ class BundleSource:
         self._raise_response_error(response)
         return response
 
-    def _retry(self, operation: Callable[[], _T]) -> _T:
+    def _retry(self, operation: Callable[[], _T], *, kind: str) -> _T:
         for attempt in range(len(RETRY_BACKOFF_SECONDS) + 1):
             try:
                 return operation()
-            except RetryableSourceError:
+            except RetryableSourceError as error:
                 if attempt == len(RETRY_BACKOFF_SECONDS):
                     raise
-                self._sleep(RETRY_BACKOFF_SECONDS[attempt])
+                with self._performance_lock:
+                    if kind == "listing":
+                        self._listing_retries += 1
+                    else:
+                        self._download_retries += 1
+                delay = self._jitter(RETRY_BACKOFF_SECONDS[attempt])
+                if not isinstance(delay, int | float) or isinstance(delay, bool):
+                    raise TypeError("Retry jitter must return seconds")
+                delay = float(delay)
+                if not math.isfinite(delay) or delay < 0:
+                    raise ValueError("Retry jitter must return finite non-negative seconds")
+                if error.retry_after_seconds is not None:
+                    delay = max(delay, min(error.retry_after_seconds, MAX_RETRY_AFTER_SECONDS))
+                with self._performance_lock:
+                    self._retry_sleep_seconds += delay
+                self._sleep(delay)
         raise AssertionError("Retry loop must return or raise")
 
     def stream(self, index: RawHourIndex) -> Iterator[Bundle]:
         """Yield at most ``lookahead`` retained downloads, in index order."""
         _validate_index(index)
-        with ThreadPoolExecutor(max_workers=self._download_concurrency) as executor:
+        executor = ThreadPoolExecutor(max_workers=self._download_concurrency)
+        try:
             pending: dict[int, Future[Bundle]] = {}
             submitted = 0
             yielded = 0
@@ -268,15 +361,27 @@ class BundleSource:
                     )
                     submitted += 1
                 future = pending.pop(yielded)
-                yield future.result()
+                wait_started = time.perf_counter()
+                try:
+                    bundle = future.result()
+                finally:
+                    waited = time.perf_counter() - wait_started
+                    with self._performance_lock:
+                        self._download_wait_seconds += waited
+                yield bundle
                 yielded += 1
+        except BaseException:
+            executor.shutdown(wait=True, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
 
     def _download_and_validate(self, index: RawHourIndex, item: BundleRef) -> Bundle:
         active = item
         try:
             content = self._download(active)
         except _InvalidDownload as error:
-            return Bundle(item, None, None, error.observed_bytes, error.reason)
+            raise _bundle_admission_failure(error) from error
         except DownloadUrlExpired:
             with self._refresh_lock:
                 refreshed = self.hour_index(index.source_hour)
@@ -298,26 +403,23 @@ class BundleSource:
             try:
                 content = self._download(active)
             except _InvalidDownload as error:
-                return Bundle(item, None, None, error.observed_bytes, error.reason)
+                raise _bundle_admission_failure(error) from error
             except DownloadUrlExpired:
                 raise RetryableSourceError(
                     "download_url_expired", "Refreshed Bundle capability expired"
                 ) from None
-        digest = hashlib.sha256(content).hexdigest()
-        if item.bytes is not None and len(content) != item.bytes:
-            return Bundle(item, None, digest, len(content), "bundle_length_mismatch")
-        if item.sha256 is not None and digest != item.sha256:
-            return Bundle(item, None, digest, len(content), "bundle_sha256_mismatch")
         try:
-            validate_bundle(content, expected_bundle_id=item.bundle_id)
+            return admit_bundle(item, content)
         except BundleSourceError as error:
-            return Bundle(item, None, digest, len(content), error.reason)
-        return Bundle(item, content, digest, len(content))
+            raise _bundle_admission_failure(error) from error
 
     def _download(self, item: BundleRef) -> bytes:
-        return self._retry(lambda: self._download_once(item))
+        return self._retry(lambda: self._download_once(item), kind="download")
 
     def _download_once(self, item: BundleRef) -> bytes:
+        started = time.perf_counter()
+        with self._performance_lock:
+            self._download_attempts += 1
         try:
             with self._client.stream("GET", item.download_url) as response:
                 if response.status_code >= 400:
@@ -344,6 +446,7 @@ class BundleSource:
                     raise RetryableSourceError(
                         code or "bundle_download_retryable",
                         "Bundle download temporarily failed",
+                        retry_after_seconds=_retry_after_seconds(response, self._clock()),
                     )
                 if response.status_code >= 400:
                     raise SourceContractError(
@@ -379,11 +482,17 @@ class BundleSource:
                         "Bundle length differs from Content-Length",
                         len(content),
                     )
+                with self._performance_lock:
+                    self._downloaded_bytes += len(content)
                 return content
         except httpx.TransportError as error:
             raise RetryableSourceError(
                 "source_transport_error", "Bundle download transport failed"
             ) from error
+        finally:
+            elapsed_ms = max(time.perf_counter() - started, 0.0) * 1000
+            with self._performance_lock:
+                self._download_latencies_ms.append(elapsed_ms)
 
     def _is_past_retention(self, hour: datetime) -> bool:
         now = self._clock()
@@ -391,8 +500,7 @@ class BundleSource:
             raise ValueError("Bundle Source clock must be timezone-aware")
         return hour < now.astimezone(UTC) - self._retention
 
-    @staticmethod
-    def _raise_response_error(response: httpx.Response) -> None:
+    def _raise_response_error(self, response: httpx.Response) -> None:
         if response.status_code < 400:
             return
         observed_code, retryable = _response_error_details(response)
@@ -402,7 +510,11 @@ class BundleSource:
         if response.status_code in {401, 403}:
             raise SourceContractError(code, "Bundle collection authentication failed")
         if response.status_code in {408, 429} or response.status_code >= 500 or retryable:
-            raise RetryableSourceError(code, "Bundle collection temporarily failed")
+            raise RetryableSourceError(
+                code,
+                "Bundle collection temporarily failed",
+                retry_after_seconds=_retry_after_seconds(response, self._clock()),
+            )
         raise SourceContractError(code, "Bundle collection request was rejected")
 
     @classmethod
@@ -495,6 +607,23 @@ def source_hour_key(value: datetime | str) -> str:
 
 def raw_commit_sha256(items: tuple[BundleRef, ...]) -> str:
     return hashlib.sha256(_canonical_json([_identity(item) for item in items])).hexdigest()
+
+
+def admit_bundle(ref: BundleRef, content: bytes) -> Bundle:
+    """Validate one complete Bundle once and return its admitted representation."""
+    if not isinstance(content, bytes):
+        raise TypeError("Bundle content must be bytes")
+    digest = hashlib.sha256(content).hexdigest()
+    if ref.bytes is not None and len(content) != ref.bytes:
+        raise SourceContractError(
+            "bundle_length_mismatch", "Downloaded Bundle length differs from its listing"
+        )
+    if ref.sha256 is not None and digest != ref.sha256:
+        raise SourceContractError(
+            "bundle_sha256_mismatch", "Downloaded Bundle digest differs from its listing"
+        )
+    manifest, run_content = open_bundle(content, expected_bundle_id=ref.bundle_id)
+    return Bundle(ref, digest, len(content), manifest, run_content)
 
 
 def validate_bundle(content: bytes, *, expected_bundle_id: str) -> Mapping[str, Any]:
@@ -590,6 +719,41 @@ def open_bundle(content: bytes, *, expected_bundle_id: str) -> tuple[Mapping[str
     payload = _mapping(run["payload"], "run.payload")
     length = _integer(payload["length"], "run.payload.length")
     return manifest, content[payload_start : payload_start + length]
+
+
+def _bundle_admission_failure(error: BundleSourceError) -> RetryableSourceError:
+    return RetryableSourceError(
+        "bundle_validation_failed", f"Bundle validation failed: {error.reason}"
+    )
+
+
+def _retry_after_seconds(response: httpx.Response, now: datetime) -> float | None:
+    value = response.headers.get("Retry-After")
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except TypeError, ValueError, OverflowError:
+            return None
+        if retry_at.tzinfo is None or retry_at.utcoffset() is None:
+            return None
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("Bundle Source clock must be timezone-aware")
+        seconds = (retry_at.astimezone(UTC) - now.astimezone(UTC)).total_seconds()
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return seconds
+
+
+def _percentile(values: tuple[float, ...], quantile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = math.ceil(quantile * len(ordered)) - 1
+    return round(ordered[max(index, 0)], 3)
 
 
 def _validate_index(index: RawHourIndex) -> None:
