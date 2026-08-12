@@ -80,11 +80,12 @@ Offline measurements on 2026-08-12:
   largest committed real hour): the batched path peaked at 252 MiB total RSS,
   159 MiB above its fresh-process baseline, and wrote 23 row groups.
 
-The projection component is therefore constant-space in hour row count. The
-expected end-to-end peak for a busy real hour is roughly 0.3–0.7 GiB after
-allowing for the configured 128-download look-ahead and one decoded Bundle;
-the next real heal should record the production number in `status.json` and
-replace this estimate.
+The projection component is therefore constant-space in hour row count.
+Confirmed in production on 2026-08-12: healing a busy real hour
+(2026-08-12T10, 2,414 Bundles, 734,544 rows, 21.7 MiB Parquet) with the
+batched path peaked at **0.65 GiB RSS** for the whole run — inside
+acceptance #5's 1 GiB/hour bound, with the 128-download look-ahead
+configured.
 
 ## Still open
 
