@@ -1,21 +1,18 @@
 # BazaarPlusPlus Analyzer
 
-The analyzer converts verified Bundle V5 deliveries into local hourly facts
-and exactly two current consumer snapshots:
+The analyzer converts verified Bundle V5 deliveries into local hourly facts and
+two independent current snapshots:
 
 ```text
 analyzer-v5/heroes/latest.json
 analyzer-v5/builds/latest.json
 ```
 
-The Web snapshot contains one to seven newest-first daily partitions of
-additive integer Hero metrics for `legend` and `non_legend`. The Mod snapshot
-contains the current schema-2 Ten-Win Build corpus with deterministic lookup
-tables and card indices. Both use the latest consecutive Complete Source Days,
-up to seven, and are calculated, validated, and replaced independently. One
-complete day is sufficient to publish.
+## Operate
 
-## Operator commands
+Install the locked environment with `uv sync --locked`, copy `.env.example` to `.env`,
+and fill in the required values. Configuration comes only from the repository
+`.env`.
 
 ```bash
 uv run bpp run
@@ -24,14 +21,16 @@ uv run bpp status --json
 uv run bpp verify --deep
 ```
 
-Configuration is read from the repository `.env`. Optional
-`BPP_SOURCE_EPOCH=YYYY-MM-DD` excludes every earlier UTC Source Day from
-healing, sealing, and analysis. `--no-publish` does not construct an R2
-adapter. Tests use only fake/local object stores.
+Use `uv run bpp --help` and `uv run bpp <command> --help` for the complete
+operator interface.
 
-The authoritative domain vocabulary is in `CONTEXT.md`; the wire and metric
-contract is in `docs/specs/consumer-data-contract.md`; strict schemas are in
-`contracts/v5/`.
+## Documentation
+
+- Domain terms and boundaries: `CONTEXT.md`
+- Pipeline recovery and publication invariants: `docs/architecture.md`
+- Consumer calculations and cross-field semantics: `docs/specs/consumer-data-contract.md`
+- JSON wire shapes: `contracts/v5/*.schema.json`
+- Measured operational limits: `docs/measurements.md`
 
 ## Quality gate
 

@@ -1,16 +1,11 @@
-# Analyzer V5 consumer schemas
+# Consumer schemas
 
-`contracts/v5/` contains the complete public contract. It has exactly two
-strict Draft 2020-12 JSON Schemas:
+These strict Draft 2020-12 schemas own field names, types, required fields,
+enums, and scalar bounds:
 
-- `heroes.schema.json` validates `analyzer-v5/heroes/latest.json`;
+- `heroes.schema.json` validates `analyzer-v5/heroes/latest.json`.
 - `builds.schema.json` validates `analyzer-v5/builds/latest.json`.
 
-Both public objects are mutable current snapshots. There is no manifest,
-release directory, public daily partition, quality object, or public history.
-The semantic invariants that JSON Schema cannot express—consecutive window
-dates, the canonical Hero × Segment row set, additive denominators, layout
-occupancy, and bidirectional card indices—are enforced by
-`bppanalyzer.publication.validate_snapshot` before an object is replaced.
-The Heroes schema conditionally requires the `days` array length to equal
-`window.days`; both schemas accept window lengths from one through seven.
+Cross-field and calculation semantics live in
+`docs/specs/consumer-data-contract.md`. `validate_snapshot` enforces both
+authorities before publication.
