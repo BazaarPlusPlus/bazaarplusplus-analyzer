@@ -65,6 +65,10 @@ def payload(
     account_id: str = "account-1",
     started_at: str = "2026-08-10T12:00:00Z",
     battle_at: str = "2026-08-10T12:10:00Z",
+    winner_combatant_id: str | None = None,
+    loser_combatant_id: str | None = None,
+    victories: int = 10,
+    losses: int = 0,
 ) -> bytes:
     player = [
         account_id, "Alice", "Vanessa", "Legendary", 1100, 10, 2, 10, 8, 12, 1, 1
@@ -78,7 +82,17 @@ def payload(
     ]
     battle = [
         "battle-1",
-        [battle_at, 10, 2, "encounter-1", "PvP", "Win", account_id, "account-2", True],
+        [
+            battle_at,
+            10,
+            2,
+            "encounter-1",
+            "PvP",
+            "Win",
+            winner_combatant_id or account_id,
+            loser_combatant_id or "account-2",
+            True,
+        ],
         [player, opponent],
         [[
             ["player_hand", "Complete", "capture", [card]],
@@ -94,7 +108,7 @@ def payload(
         account_id,
         [
             "Vanessa", "Ranked", 42, started_at, "2026-08-10T12:30:00Z",
-            "completed", 10, 2, 10, 0, "Gold", 1000, "Legendary", 1100,
+            "completed", 10, 2, victories, losses, "Gold", 1000, "Legendary", 1100,
             100, 50, 2, 10, 8, 12, "stable", "5.1.0",
         ],
         [],

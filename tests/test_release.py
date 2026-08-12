@@ -79,7 +79,10 @@ def _spill_stress_store(root: Path, *, non_final_battles: int) -> _SyntheticSpil
                      'Jules' AS opponent_hero,
                      'Gold' AS opponent_rank,
                      1000::BIGINT AS opponent_rating,
-                     'player' AS winner_side
+                     'account-0' AS winner_combatant_id,
+                     'ghost' AS loser_combatant_id,
+                     'player' AS winner_side,
+                     'Dooley' AS winner_hero
               FROM range({non_final_battles + 1}) AS values(battle)
             ) TO {release_module._sql_string(str(paths['battles']))}
               (FORMAT PARQUET, COMPRESSION ZSTD)
@@ -176,6 +179,34 @@ def test_release_id_uses_the_exact_canonical_identity_chain() -> None:
         builder_code_version="builder-test",
         policy_version="policy-test",
     ) == expected
+
+
+def test_release_derives_hero_outcomes_from_raw_side_name_facts(
+    tmp_path: Path,
+) -> None:
+    store = sealed_store(tmp_path, 1)
+
+    release = ReleaseBuilder(tmp_path, store=store).build(
+        "2026-08-07", store.seals()
+    )
+
+    hero_window = json.loads((release.path / "window/heroes.json").read_bytes())
+    dooley = next(
+        row
+        for row in hero_window["rows"]
+        if row["hero"] == "Dooley" and row["segment"] == "all"
+    )
+    assert dooley["win_rate"] == 0.6
+    assert dooley["matchups"] == [
+        {
+            "opponent_hero": "Dooley",
+            "decided": 50,
+            "wins": 30,
+            "losses": 20,
+            "win_rate": 0.6,
+        }
+    ]
+    assert dooley["ghost"] == {"battles": 50, "win_rate": 0.4}
 
 
 def test_duckdb_candidate_ranking_uses_the_payload_score() -> None:

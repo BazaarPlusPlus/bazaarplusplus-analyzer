@@ -24,7 +24,7 @@ from bpp_analyzer.object_store import ObjectStat, ObjectStore, StoredObject
 
 
 EPOCH_DAY = date(2026, 8, 7)
-BUILDER_CODE_VERSION = "0.3.0"
+BUILDER_CODE_VERSION = "0.3.1"
 POLICY_VERSION = "v5-contract-1"
 MAX_FETCH_ROWS = 10_000
 MIN_RATED_BATTLES = 50
@@ -689,7 +689,26 @@ class _Analytics:
         )
         connection.execute(
             "CREATE TEMP VIEW analytic_battles AS "
-            "SELECT *, CASE WHEN trim(player_hero)='Hero8' THEN 'TheDragons' "
+            "SELECT * EXCLUDE (winner_side,winner_hero), "
+            "CASE WHEN winner_combatant_id='Player' THEN 'player' "
+            "WHEN winner_combatant_id='Opponent' THEN 'opponent' "
+            "WHEN winner_combatant_id IS NOT NULL "
+            "AND winner_combatant_id=player_account_id THEN 'player' "
+            "WHEN winner_combatant_id IS NOT NULL "
+            "AND winner_combatant_id=opponent_account_id THEN 'opponent' "
+            "ELSE NULL END AS winner_side, "
+            "CASE WHEN winner_combatant_id='Player' "
+            "OR (winner_combatant_id IS NOT NULL "
+            "AND winner_combatant_id=player_account_id) "
+            "THEN CASE WHEN trim(player_hero)='Hero8' THEN 'TheDragons' "
+            "ELSE trim(player_hero) END "
+            "WHEN winner_combatant_id='Opponent' "
+            "OR (winner_combatant_id IS NOT NULL "
+            "AND winner_combatant_id=opponent_account_id) "
+            "THEN CASE WHEN trim(opponent_hero)='Hero8' THEN 'TheDragons' "
+            "ELSE trim(opponent_hero) END "
+            "ELSE NULL END AS winner_hero, "
+            "CASE WHEN trim(player_hero)='Hero8' THEN 'TheDragons' "
             "ELSE trim(player_hero) END AS player_hero_norm, "
             "CASE WHEN trim(opponent_hero)='Hero8' THEN 'TheDragons' "
             "ELSE trim(opponent_hero) END AS opponent_hero_norm FROM battles_fact"

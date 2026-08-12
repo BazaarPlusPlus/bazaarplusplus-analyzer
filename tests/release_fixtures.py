@@ -81,6 +81,7 @@ def _populated_rows(
     battles: list[dict[str, object]] = []
     for index in range(battle_count):
         battle_id = f"battle-{day}-{index}"
+        winner = "Player" if index < 30 else "Opponent"
         battles.append(
             {
                 "source_hour": hour,
@@ -97,7 +98,10 @@ def _populated_rows(
                 "opponent_hero": "Dooley",
                 "opponent_rank": "Gold",
                 "opponent_rating": 1000 if day_offset == 0 else None,
-                "winner_side": "player" if index < 30 else "opponent",
+                "winner_combatant_id": winner,
+                "loser_combatant_id": "Opponent" if winner == "Player" else "Player",
+                "winner_side": None,
+                "winner_hero": None,
             }
         )
     cards = [

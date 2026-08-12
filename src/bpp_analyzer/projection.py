@@ -17,7 +17,7 @@ import pyarrow as pa
 from bpp_analyzer.bundle_source import Bundle, BundleSourceError, RawHourIndex, open_bundle
 
 
-PROJECTION_VERSION = "v5-phase1-1"
+PROJECTION_VERSION = "v5-phase1-2"
 MAX_DECOMPRESSED_RUN_BYTES = 64 * 1024 * 1024
 
 HERO_ALIASES = {"Hero8": "TheDragons"}
@@ -377,10 +377,14 @@ def _battle_row(
     player_id = _nullable_text(player[0], "player.account_id")
     opponent_id = _nullable_text(opponent[0], "opponent.account_id")
     winner_id = _nullable_text(facts[6], "battle.winner_id")
-    if winner_id is not None and winner_id == player_id:
+    if winner_id == "Player" or (
+        winner_id is not None and winner_id == player_id
+    ):
         winner_side = "player"
         winner_hero = _hero(_nullable_text(player[2], "player.hero"))
-    elif winner_id is not None and winner_id == opponent_id:
+    elif winner_id == "Opponent" or (
+        winner_id is not None and winner_id == opponent_id
+    ):
         winner_side = "opponent"
         winner_hero = _hero(_nullable_text(opponent[2], "opponent.hero"))
     else:

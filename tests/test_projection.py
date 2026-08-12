@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 import hashlib
 
 import httpx
+import pytest
 
 from bpp_analyzer.bundle_source import (
     Bundle,
@@ -14,6 +15,103 @@ from bpp_analyzer.bundle_source import (
 )
 from bpp_analyzer.projection import project_hour
 from tests.bundle_fixtures import SOURCE_HOUR, bundle_bytes, payload
+
+
+def _project_payload(run_payload: bytes):
+    content = bundle_bytes("bundle-a", run_payload=run_payload)
+    ref = BundleRef(
+        bundle_id="bundle-a",
+        available_at_ms=int(SOURCE_HOUR.timestamp() * 1_000),
+        download_url="https://download.invalid/a",
+        download_expires_at_ms=int(SOURCE_HOUR.timestamp() * 1_000) + 60_000,
+        sha256=hashlib.sha256(content).hexdigest(),
+        bytes=len(content),
+    )
+    index = RawHourIndex(
+        source_hour=SOURCE_HOUR,
+        items=(ref,),
+        raw_commit_sha256=raw_commit_sha256((ref,)),
+        pages=1,
+    )
+    return project_hour(
+        index,
+        [Bundle(ref, content, hashlib.sha256(content).hexdigest(), len(content))],
+    )
+
+
+@pytest.mark.parametrize(
+    ("winner_id", "loser_id", "winner_side", "winner_hero"),
+    (
+        ("Player", "Opponent", "player", "Vanessa"),
+        ("Opponent", "Player", "opponent", "Pygmalien"),
+    ),
+)
+def test_battle_outcome_uses_bundle_side_names(
+    winner_id: str,
+    loser_id: str,
+    winner_side: str,
+    winner_hero: str,
+) -> None:
+    projected = _project_payload(
+        payload(
+            winner_combatant_id=winner_id,
+            loser_combatant_id=loser_id,
+            victories=int(winner_side == "player"),
+            losses=int(winner_side == "opponent"),
+        )
+    )
+
+    battle = projected.tables["battles"].to_pylist()[0]
+    run = projected.tables["runs"].to_pylist()[0]
+    assert battle["winner_combatant_id"] == winner_id
+    assert battle["loser_combatant_id"] == loser_id
+    assert battle["winner_side"] == winner_side
+    assert battle["winner_hero"] == winner_hero
+    assert run["battle_decided_count"] == 1
+    assert run["battle_player_win_count"] == (winner_side == "player")
+    assert run["battle_player_loss_count"] == (winner_side == "opponent")
+    assert "run_outcome_count_mismatch" not in {
+        row["code"] for row in projected.tables["quality"].to_pylist()
+    }
+
+
+@pytest.mark.parametrize(
+    ("winner_id", "loser_id", "winner_side", "winner_hero"),
+    (
+        ("account-1", "account-2", "player", "Vanessa"),
+        ("account-2", "account-1", "opponent", "Pygmalien"),
+    ),
+)
+def test_battle_outcome_falls_back_to_participant_account_ids(
+    winner_id: str,
+    loser_id: str,
+    winner_side: str,
+    winner_hero: str,
+) -> None:
+    battle = _project_payload(
+        payload(
+            winner_combatant_id=winner_id,
+            loser_combatant_id=loser_id,
+        )
+    ).tables["battles"].to_pylist()[0]
+
+    assert battle["winner_side"] == winner_side
+    assert battle["winner_hero"] == winner_hero
+
+
+def test_battle_outcome_keeps_an_unknown_combatant_undecided() -> None:
+    projected = _project_payload(
+        payload(
+            winner_combatant_id="unknown-combatant",
+            loser_combatant_id="another-unknown-combatant",
+        )
+    )
+
+    battle = projected.tables["battles"].to_pylist()[0]
+    run = projected.tables["runs"].to_pylist()[0]
+    assert battle["winner_side"] is None
+    assert battle["winner_hero"] is None
+    assert run["battle_decided_count"] == 0
 
 
 def test_bundle_digest_magic_and_segment_failures_are_quarantined_without_dropping_valid_data(
