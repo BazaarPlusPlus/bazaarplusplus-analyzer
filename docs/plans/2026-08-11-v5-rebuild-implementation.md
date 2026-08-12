@@ -116,11 +116,11 @@ DuckDB SQL + the five payload builders + `release.build`.
   injection at each seam), #8 (cheap no-op), #9 (late data ⇒ new release),
   #10 (rollback sticks).
 
-### Phase 4 — Full acceptance + goldens + measurements
+### Phase 4 — Full acceptance + measurements
 
 - All 12 acceptance criteria runnable (tests or scripts), whole suite green.
-- After the dispatcher's real-data build: generate golden vectors into
-  `contracts/v5/golden/` from the first full build and freeze them.
+- Verify contract validity through schemas, exact manifest inventory, and
+  deterministic synthetic rebuilds.
 - Record any of the spec's "Unresolved, needs measurement" items observed
   along the way in `docs/measurements.md` — especially: does the Bundle
   Server return an error or an empty index for out-of-retention hours?

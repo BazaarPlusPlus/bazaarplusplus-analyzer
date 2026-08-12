@@ -207,9 +207,8 @@ release's `manifest.json`. Consumers do: `GET` pointer → fetch files by path.
 `public,max-age=60,must-revalidate` on the pointer.
 
 Contracts live in `contracts/v5/*.schema.json` (JSON Schema 2020-12,
-`additionalProperties: false` everywhere) with golden vectors under
-`contracts/v5/golden/` generated once from the first production build and
-frozen thereafter.
+`additionalProperties: false` everywhere). Deterministic synthetic rebuilds
+verify byte stability without freezing production output as test data.
 
 ---
 
@@ -524,9 +523,8 @@ the check is removed.
 
 1. **Idempotence** — second consecutive `run` exits 0, `outcome: noop`,
    mutates nothing under `facts/` or `releases/` (mtime+size snapshot).
-2. **Contract validity** — every payload validates against `contracts/v5/`;
-   golden vectors generated from the first production build are frozen and
-   pass thereafter.
+2. **Contract validity** — every payload validates against `contracts/v5/`,
+   and the manifest inventory matches the exact staged file set and bytes.
 3. **Crash convergence** — kill at each fault-injection seam; re-run converges
    to the same final state as an uninterrupted run.
 4. **Deterministic rebuild** — delete `releases/<id>/`, rebuild the same

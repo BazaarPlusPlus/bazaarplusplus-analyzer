@@ -2,8 +2,7 @@
 
 The consumer-facing contract for `analyzer-v5/` on R2. Five kinds; every
 payload validates against its schema here before a release may be staged
-(spec check 9). Golden vectors under `golden/` are generated once from the
-first production build and frozen thereafter.
+(spec check 9).
 
 ## File set
 

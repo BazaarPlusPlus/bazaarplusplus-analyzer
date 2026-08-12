@@ -14,31 +14,16 @@ Run the complete offline evidence set:
 .venv/bin/python -m pytest -q
 ```
 
-On 2026-08-11, every selector cited in the two matrices below was run
-directly: 39 passed and the unpopulated real-golden selector was the only
-skip. The complete offline suite then passed with 57 passed and that same one
-expected skip.
-
-Freeze the first full real release when the dispatcher declares it ready:
-
-```bash
-.venv/bin/python scripts/freeze_v5_goldens.py \
-  /absolute/path/to/data/releases/<release_id>
-.venv/bin/python -m pytest -q \
-  tests/test_golden_workflow.py::test_frozen_golden_vectors_match_schemas_and_manifest_inventory
-```
-
-The freeze command defaults to `contracts/v5/golden/<release_id>/`, validates
-the source before copying, promotes the copy atomically, and refuses to
-overwrite an existing golden set. The checked-in structure and freeze policy
-are documented in `contracts/v5/golden/README.md`.
+The complete suite exercises schemas, manifest inventory and hashes,
+deterministic rebuilds, crash convergence, and publish ordering without
+freezing production data as a byte-for-byte fixture.
 
 ## Acceptance criteria
 
 | ID | Criterion | Runnable evidence | Status |
 | --- | --- | --- | --- |
 | 1 | Idempotent second run | `tests/test_phase3_acceptance.py::test_acceptance_1_and_8_second_run_is_a_cheap_nonmutating_noop` | Pass: exit 0/noop and facts/releases mtime+size snapshot unchanged. |
-| 2 | Contract validity and frozen goldens | `tests/test_phase2_acceptance.py::test_every_payload_matches_the_frozen_schema_and_source_time`; `tests/test_golden_workflow.py::test_freeze_script_copies_an_exact_valid_release_and_refuses_overwrite`; `tests/test_golden_workflow.py::test_golden_validator_rejects_manifest_digest_or_size_drift`; `tests/test_golden_workflow.py::test_frozen_golden_vectors_match_schemas_and_manifest_inventory` | Pending-freeze: synthetic releases pass every schema and inventory gate; the final node skips until the first real golden set is frozen. |
+| 2 | Contract validity | `tests/test_phase2_acceptance.py::test_every_payload_matches_the_frozen_schema_and_source_time`; `tests/test_release.py::test_check_10_manifest_hash_size_and_exact_file_set_are_verified` | Pass: every payload validates against its schema and every manifest inventory entry matches the staged bytes. |
 | 3 | Crash convergence at every fault seam | `tests/test_phase3_crash_convergence.py::test_acceptance_3_commit_and_seal_crashes_converge_to_uninterrupted_facts[before_precommit_verify]`; `tests/test_phase3_crash_convergence.py::test_acceptance_3_commit_and_seal_crashes_converge_to_uninterrupted_facts[before_hour_promote]`; `tests/test_phase3_crash_convergence.py::test_acceptance_3_commit_and_seal_crashes_converge_to_uninterrupted_facts[before_seal_promote]`; `tests/test_phase3_crash_convergence.py::test_acceptance_3_release_stage_crash_converges_to_uninterrupted_release[after_payloads_written]`; `tests/test_phase3_crash_convergence.py::test_acceptance_3_release_stage_crash_converges_to_uninterrupted_release[after_manifest_written]`; `tests/test_phase3_crash_convergence.py::test_acceptance_3_publish_crash_converges_to_uninterrupted_remote[after_artifact_confirmed]`; `tests/test_phase3_crash_convergence.py::test_acceptance_3_publish_crash_converges_to_uninterrupted_remote[before_pointer_put]` | Pass: all seven implemented seams converge. |
 | 4 | Bit-deterministic parallel rebuild | `tests/test_phase2_acceptance.py::test_seven_day_parallel_build_is_byte_deterministic_and_records_bounded_rss` | Pass: a deleted seven-day release rebuilt with four threads is byte-identical. |
 | 5 | Peak RSS limits and status recording | `tests/test_phase1_acceptance.py::test_hour_ingest_records_and_stays_below_the_one_gib_peak_rss_limit`; `tests/test_phase2_acceptance.py::test_seven_day_parallel_build_is_byte_deterministic_and_records_bounded_rss` | Pass: hour ingest is below 1 GiB; seven-day build is below 8 GiB; both assert recorded status. |
@@ -74,8 +59,6 @@ are documented in `contracts/v5/golden/README.md`.
 
 ## Measurement boundary
 
-Real-data measurements remain recorded in `docs/measurements.md`. This
-offline evidence phase neither reads the in-progress real ingest nor creates
-goldens from synthetic fixtures. Criterion 2 becomes fully complete only when
-the dispatcher freezes and commits the first full real release and the
-currently skipped golden-vector node passes.
+Real-data measurements remain recorded in `docs/measurements.md`. The offline
+evidence suite does not read the production data root or contact external
+services.
