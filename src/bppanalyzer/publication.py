@@ -389,6 +389,10 @@ class SnapshotBuilder:
                    AND c.battle_id=f.final_battle_id
                   WHERE c.card_set_label='player_hand'
                     AND c.owner_side='player' AND c.card_kind='item'
+                    -- Socket-effect overlays (e.g. Jules cooler/heater sockets,
+                    -- card_type 7) share sockets with real items and are not
+                    -- part of the board.
+                    AND coalesce(c.card_type, 0)=0
                     AND r.final_player_item_signature IS NOT NULL
                   GROUP BY f.bundle_id, f.run_id, f.source_day, f.hero_norm,
                            f.victories, f.losses, f.run_day, f.final_battle_id

@@ -310,7 +310,12 @@ A completed Accepted Run contributes a final layout only when:
 - the Run's `final_battle_id` identifies that Battle;
 - the player-hand item snapshot is present;
 - every card has a positive size and a valid template identifier;
-- the final board occupies exactly 10 slots.
+- the final board occupies exactly 10 slots with no overlap and no gap.
+
+Socket-effect overlay entities (card type 7 — for example Jules's cooler and
+heater sockets and TheDragons's note sockets) share a socket with a real item.
+They are excluded from the layout, the Build Identity, and the occupancy
+check before the rules above are applied.
 
 The Build Identity is the hero plus the sorted multiset of final-board card
 template identifiers. Position, tier, and enchantment do not participate in

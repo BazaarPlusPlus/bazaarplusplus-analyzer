@@ -280,6 +280,7 @@ def _layout_run(
     status: str = "Captured",
     final_count: int = 1,
     final_battle_id: str | None = None,
+    socket_effect_slots: tuple[int, ...] = (),
 ) -> dict[str, list[dict[str, object]]]:
     day = "2026-08-07"
     hour = f"{day}T00"
@@ -347,9 +348,33 @@ def _layout_run(
             "size": sizes[position],
             "socket": slot,
             "tier": tier,
+            "card_type": 0,
         }
         for position, (card_id, slot) in enumerate(zip(card_ids, observed_slots, strict=True))
     ]
+    cards.extend(
+        {
+            "source_hour": hour,
+            "source_day": day,
+            "available_at_ms": index,
+            "bundle_id": bundle_id,
+            "run_id": run_id,
+            "battle_id": actual_final,
+            "card_set_label": "player_hand",
+            "card_set_status": status,
+            "owner_side": "player",
+            "card_kind": "item",
+            "slot_index": slot,
+            "instance_id": f"effect-{index}-{position}",
+            "template_id": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+            "name": "[Cooler] Socket Effect",
+            "size": 1,
+            "socket": slot,
+            "tier": tier,
+            "card_type": 7,
+        }
+        for position, slot in enumerate(socket_effect_slots)
+    )
     return {"runs": [run], "battles": battles, "battle_cards": cards}
 
 
@@ -375,6 +400,7 @@ def policy_fact_store(tmp_path_factory: pytest.TempPathFactory):
         _layout_run(6, valid_ids, (4, 5)),
         _layout_run(7, valid_ids, (5, 5), slots=(0, 3)),
         _layout_run(8, valid_ids, (5, 5), slots=(2, 5)),
+        _layout_run(9, valid_ids, (5, 5), socket_effect_slots=(0, 5)),
         _layout_run(10, identity, (5, 5), run_day=1, slots=(0, 5), tier="Gold"),
         _layout_run(11, identity, (5, 5), run_day=2, slots=(0, 5), tier="Gold"),
         _layout_run(12, identity, (5, 5), run_day=3, slots=(0, 5), tier="Diamond"),
@@ -414,7 +440,7 @@ def test_build_eligibility_rejects_every_incomplete_final_layout_boundary(
     built = SnapshotBuilder(root, store=store).build_builds(window)
     payload = json.loads(built.content)
 
-    assert built.stats.eligible_layout_runs == 6
+    assert built.stats.eligible_layout_runs == 7
     assert built.stats.candidate_builds == 2
     assert built.stats.published_builds == 2
     assert len(payload["heroes"]["Dooley"]["builds"]) == 1
@@ -429,11 +455,11 @@ def test_fact_report_counts_each_rejection_reason_without_admitting_the_run(
 
     stats = SnapshotBuilder(root, store=store).fact_stats(window)
 
-    assert stats.raw_runs == 15
+    assert stats.raw_runs == 16
     assert stats.discarded_unknown_hero == 1
     assert stats.discarded_unknown_final_rank == 1
-    assert stats.included_runs == 14
-    assert stats.included_battles == 15
+    assert stats.included_runs == 15
+    assert stats.included_battles == 16
 
 
 def test_representative_layout_mode_tie_break_and_nearest_rank_p75(
