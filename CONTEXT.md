@@ -23,9 +23,14 @@ _Avoid_: Run day, game day
 A Source Day for which all 24 Source Hours are present and accepted.
 _Avoid_: Latest day, successful day
 
+**Source Epoch**:
+An optional inclusive UTC date before which Source Days are outside the data
+population. Pre-epoch days are not healed, sealed, or analyzed.
+
 **Analysis Window**:
-The latest seven consecutive Complete Source Days included in a consumer
-snapshot.
+The sequence ending at the latest sealed Complete Source Day and extending
+backward through consecutive Complete Source Days, with a minimum of one day
+and a maximum of seven days. It never crosses the Source Epoch.
 _Avoid_: Release window, lookback
 
 ## Runs and segments

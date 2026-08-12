@@ -18,7 +18,8 @@ One locked invocation performs four phases:
 1. enumerate settled Source Hours and stream verified Bundles;
 2. project accepted Runs into hourly Parquet and seal a Source Day only after
    all hours `00` through `23` verify;
-3. select the latest exact seven-day consecutive Analysis Window;
+3. select the latest consecutive Analysis Window containing one to seven
+   Complete Source Days;
 4. independently build, validate, save, and optionally replace each consumer
    snapshot.
 
@@ -36,6 +37,10 @@ Run, Battle, or Battle Card fact rows.
 Download or Bundle validation failure leaves the Source Hour uncommitted.
 Missing or corrupt hourly facts prevent a day seal. A day seal contains and
 verifies exactly 24 immutable hourly commit identities.
+
+When `BPP_SOURCE_EPOCH` is configured, Source Days before that inclusive UTC
+boundary are excluded from healing, sealing, status consideration, and window
+selection.
 
 ## Analysis and validation
 

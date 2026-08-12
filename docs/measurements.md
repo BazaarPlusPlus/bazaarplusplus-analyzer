@@ -41,5 +41,6 @@ ingest limit.
 
 The prior five-day measurement produced about 1 MiB across all legacy files.
 The current architecture removes manifest, quality, daily-object, and history
-overhead and publishes only the two seven-day latest snapshots. Exact sizes
-should be remeasured after the first coordinated production publication.
+overhead and publishes only the two latest snapshots, each spanning up to
+seven days. Exact sizes should be remeasured after the first coordinated
+production publication.

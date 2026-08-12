@@ -4,7 +4,7 @@
 
 The analyzer publishes two current snapshots for two independent consumers:
 
-- the Web site reads seven days of additive hero metrics;
+- the Web site reads up to seven days of additive hero metrics;
 - the Mod reads the current build recommendation corpus.
 
 The public object set is exactly:
@@ -50,12 +50,19 @@ owning Run.
 ### Complete days and windows
 
 A Complete Source Day has 24 accepted Source Hours, from `00` through `23`
-UTC. Both products use the latest seven consecutive Complete Source Days.
+UTC. Both products use the sequence ending at the latest sealed Complete
+Source Day and extending backward through consecutive Complete Source Days,
+with a minimum of one day and a maximum of seven days.
 
 If a newer Source Day has a missing hour, an unresolved download failure, or
-a failed fact validation, that day is not complete. The analyzer keeps the
-existing public snapshot until a complete seven-day window can be calculated.
-It never publishes a partial day.
+a failed fact validation, that day is not complete and is not included. The
+latest earlier sealed day can still end the Analysis Window. The analyzer
+publishes when at least one Complete Source Day is available, but it never
+publishes a partial day.
+
+`BPP_SOURCE_EPOCH` is an optional inclusive UTC date. Source Days before it
+are never downloaded, healed, sealed, or included in the Analysis Window. An
+Analysis Window cannot extend across the epoch boundary.
 
 `window.start` and `window.end` are inclusive UTC dates. `generated_at` is an
 ISO-8601 UTC timestamp describing when the snapshot was produced.
@@ -64,9 +71,10 @@ ISO-8601 UTC timestamp describing when the snapshot was produced.
 
 ### Role
 
-This object contains seven daily partitions inside one response. The Web site
-folds the daily integer counts to produce its 1-day, 3-day, and 7-day views.
-Rates and averages are never stored because they cannot be merged safely.
+This object contains one to seven daily partitions inside one response. The
+Web site folds the available daily integer counts to produce its 1-day, 3-day,
+and 7-day views. Rates and averages are never stored because they cannot be
+merged safely.
 
 Only `legend` and `non_legend` rows are stored. The Web site's `all` view is a
 field-wise sum of those two rows. Every day contains one row for every
@@ -378,9 +386,9 @@ from wall-clock time.
 ## Run report
 
 Every invocation emits one structured report to local status and logs. This
-report is operational evidence and is not a public R2 object. When no complete
-Analysis Window exists, `window` is `null` and both `published` fields are
-false.
+report is operational evidence and is not a public R2 object. When no sealed
+Complete Source Day exists at or after the configured Source Epoch, `window`
+is `null` and both `published` fields are false.
 
 ```json
 {
@@ -424,7 +432,8 @@ participation counts used by each product.
 
 Before publication, the analyzer verifies at least:
 
-- exactly seven distinct consecutive days matching `window`;
+- one to seven distinct consecutive days matching `window.days`, `start`, and
+  `end`;
 - exactly one row for each canonical hero and stored segment per day;
 - row segments are only `legend` or `non_legend`;
 - all counts are non-negative integers;

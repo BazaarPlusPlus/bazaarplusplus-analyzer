@@ -58,7 +58,11 @@ class AnalysisWindow:
 
     @property
     def value(self) -> dict[str, object]:
-        return {"start": self.start.isoformat(), "end": self.end.isoformat(), "days": 7}
+        return {
+            "start": self.start.isoformat(),
+            "end": self.end.isoformat(),
+            "days": len(self.seals),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,25 +104,35 @@ class BuiltSnapshot:
 
 
 def select_analysis_window(
-    seals: Iterable[DaySeal], anchor_day: date | str | None = None
+    seals: Iterable[DaySeal],
+    anchor_day: date | str | None = None,
+    *,
+    source_epoch: date | str | None = None,
 ) -> AnalysisWindow | None:
-    """Return the latest exact seven-day consecutive run of verified day seals."""
+    """Return one to seven latest consecutive verified day seals."""
+    epoch = parse_source_day(source_epoch) if source_epoch is not None else None
     by_day: dict[date, DaySeal] = {}
     for seal in seals:
         day = parse_source_day(seal.source_day)
+        if epoch is not None and day < epoch:
+            continue
         if day in by_day:
             raise AnalysisWindowError(f"Duplicate Complete Source Day: {day.isoformat()}")
         by_day[day] = seal
     if not by_day:
         return None
     anchor = parse_source_day(anchor_day) if anchor_day is not None else max(by_day)
-    candidates = [anchor] if anchor_day is not None else sorted(by_day, reverse=True)
-    for end in candidates:
-        days = tuple(end - timedelta(days=offset) for offset in range(ANALYSIS_DAYS - 1, -1, -1))
-        if all(day in by_day for day in days):
-            selected = tuple(by_day[day] for day in days)
-            return AnalysisWindow(selected, days[0], days[-1])
-    return None
+    if (epoch is not None and anchor < epoch) or anchor not in by_day:
+        return None
+    descending = []
+    for offset in range(ANALYSIS_DAYS):
+        candidate = anchor - timedelta(days=offset)
+        if candidate not in by_day:
+            break
+        descending.append(candidate)
+    days = tuple(reversed(descending))
+    selected = tuple(by_day[day] for day in days)
+    return AnalysisWindow(selected, days[0], days[-1])
 
 
 def wilson_score(successes: int, total: int) -> int:
@@ -628,17 +642,18 @@ def validate_snapshot(product: str, payload: Mapping[str, Any]) -> None:
     window = payload["window"]
     start = parse_source_day(window["start"])
     end = parse_source_day(window["end"])
-    if end - start != timedelta(days=ANALYSIS_DAYS - 1) or window["days"] != ANALYSIS_DAYS:
-        raise ContractViolation("Analysis Window must contain exactly seven consecutive days")
+    window_days = int(window["days"])
+    if not 1 <= window_days <= ANALYSIS_DAYS or end - start != timedelta(days=window_days - 1):
+        raise ContractViolation("Analysis Window must contain one to seven consecutive days")
     if product == "heroes":
-        _validate_heroes(payload, start, end)
+        _validate_heroes(payload, start, end, window_days)
     else:
         _validate_builds(payload)
 
 
-def _validate_heroes(payload: Mapping[str, Any], start: date, end: date) -> None:
+def _validate_heroes(payload: Mapping[str, Any], start: date, end: date, window_days: int) -> None:
     days = payload["days"]
-    expected_days = [(end - timedelta(days=offset)).isoformat() for offset in range(ANALYSIS_DAYS)]
+    expected_days = [(end - timedelta(days=offset)).isoformat() for offset in range(window_days)]
     if [item["day"] for item in days] != expected_days or expected_days[-1] != start.isoformat():
         raise ContractViolation("Hero days must be newest-first and match the Analysis Window")
     expected_rows = [

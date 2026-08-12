@@ -56,7 +56,7 @@
       "properties": {
         "start": {"$ref": "#/$defs/day"},
         "end": {"$ref": "#/$defs/day"},
-        "days": {"const": 7}
+        "days": {"type": "integer", "minimum": 1, "maximum": 7}
       }
     },
     "hero": {

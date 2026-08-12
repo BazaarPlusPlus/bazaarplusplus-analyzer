@@ -44,6 +44,7 @@ def run_command(
             summary = PipelineDriver(
                 config.data_root,
                 source=_DryRunSource(),
+                source_epoch=config.source_epoch,
             ).run(
                 heal_days=heal_days,
                 anchor_day=anchor_day,
@@ -62,6 +63,7 @@ def run_command(
                 summary = PipelineDriver(
                     config.data_root,
                     source=source,
+                    source_epoch=config.source_epoch,
                     max_run_seconds=config.max_run_seconds,
                     duckdb_memory_limit=config.duckdb_memory_limit,
                     duckdb_threads=config.duckdb_threads,
@@ -97,7 +99,7 @@ def status_command(json_output: bool) -> None:
     """Show the last atomic local health snapshot."""
     try:
         config = load_config(require_source=False)
-        value = read_status(config.data_root)
+        value = read_status(config.data_root, source_epoch=config.source_epoch)
     except ConfigurationError as error:
         raise click.UsageError(str(error)) from None
     except Exception as error:

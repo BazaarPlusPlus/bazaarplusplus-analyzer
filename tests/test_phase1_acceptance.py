@@ -183,6 +183,11 @@ def test_healing_is_oldest_first_and_settlement_is_a_pure_boundary() -> None:
     assert days[0] == date(2026, 7, 11)
     assert days[-1] == date(2026, 8, 9)
     assert len(days) == 30
+    assert healing_days(now, 30, source_epoch=date(2026, 8, 7)) == (
+        date(2026, 8, 7),
+        date(2026, 8, 8),
+        date(2026, 8, 9),
+    )
     hour = datetime(2026, 8, 9, tzinfo=UTC)
     assert not is_hour_settled(hour, datetime(2026, 8, 9, 1, 0, 59, tzinfo=UTC))
     assert is_hour_settled(hour, datetime(2026, 8, 9, 1, 1, tzinfo=UTC))

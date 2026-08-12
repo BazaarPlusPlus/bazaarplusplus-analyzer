@@ -2,6 +2,7 @@
 
 import re
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -16,6 +17,7 @@ class Config:
     data_root: Path
     api_base_url: str | None
     sync_token: str | None = field(repr=False)
+    source_epoch: date | None = None
     bundle_retention_days: int = 10
     download_concurrency: int = 4
     download_lookahead: int = 8
@@ -65,6 +67,7 @@ def load_config(
         data_root=data_root,
         api_base_url=api_base_url,
         sync_token=sync_token,
+        source_epoch=_source_epoch(values.get("BPP_SOURCE_EPOCH")),
         bundle_retention_days=_positive_int(
             values.get("BPP_BUNDLE_RETENTION_DAYS"), 10, "BPP_BUNDLE_RETENTION_DAYS"
         ),
@@ -100,6 +103,19 @@ def _positive_int(value: object, default: int, name: str) -> int:
     if parsed < 1:
         raise ConfigurationError(f"{name} must be a positive integer")
     return parsed
+
+
+def _source_epoch(value: object) -> date | None:
+    parsed = _optional(value)
+    if parsed is None:
+        return None
+    try:
+        result = date.fromisoformat(parsed)
+    except ValueError as error:
+        raise ConfigurationError("BPP_SOURCE_EPOCH must use YYYY-MM-DD") from error
+    if result.isoformat() != parsed:
+        raise ConfigurationError("BPP_SOURCE_EPOCH must use YYYY-MM-DD")
+    return result
 
 
 def _memory_limit(value: object) -> str:

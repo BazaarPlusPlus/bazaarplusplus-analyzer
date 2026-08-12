@@ -57,22 +57,65 @@ class UnexpectedSource:
         raise AssertionError("A failed index must never be streamed")
 
 
-def test_fewer_than_seven_complete_days_never_publish_a_growing_window(
-    tmp_path: Path, canonical_fact_store
-) -> None:
-    root, _store = canonical_fact_store
+class RecordingExpiredSource:
+    def __init__(self) -> None:
+        self.requested_hours: list[datetime] = []
+
+    def hour_index(self, source_hour: datetime):
+        self.requested_hours.append(source_hour)
+        raise HourExpired("source_hour_expired", "fixture expired")
+
+    def stream(self, _index):
+        raise AssertionError("An expired index must never be streamed")
+
+
+def test_one_complete_day_publishes_a_one_day_window(tmp_path: Path) -> None:
+    from tests.release_fixtures import sealed_store
+
+    root = tmp_path / "facts"
+    sealed_store(root, 1)
     objects = LocalObjectStore(tmp_path / "objects")
 
     summary = PipelineDriver(
         root,
         source=NeverSource(),
-        clock=lambda: datetime(2026, 8, 12, 23, 59, tzinfo=UTC),
+        clock=lambda: datetime(2026, 8, 7, 23, 59, tzinfo=UTC),
         object_store=objects,
-    ).run(heal_days=6, anchor_day=date(2026, 8, 12))
+    ).run(heal_days=1, anchor_day=date(2026, 8, 7))
 
     assert summary.exit_code == 0
+    assert summary.report["window"] == {
+        "start": "2026-08-07",
+        "end": "2026-08-07",
+        "days": 1,
+    }
+    assert [request.key for request in objects.requests if request.operation == "put"] == [
+        HEROES_KEY,
+        BUILDS_KEY,
+    ]
+
+
+def test_source_epoch_prevents_pre_epoch_days_from_being_healed_or_considered(
+    tmp_path: Path,
+) -> None:
+    source = RecordingExpiredSource()
+
+    summary = PipelineDriver(
+        tmp_path,
+        source=source,
+        source_epoch=date(2026, 8, 7),
+        clock=lambda: datetime(2026, 8, 9, 1, 1, tzinfo=UTC),
+    ).run(heal_days=5)
+
+    assert [hour.date() for hour in source.requested_hours] == [
+        date(2026, 8, 7),
+        date(2026, 8, 8),
+        date(2026, 8, 9),
+    ]
     assert summary.report["window"] is None
-    assert not [request for request in objects.requests if request.operation == "put"]
+    status = read_status(tmp_path)
+    assert all(day >= "2026-08-07" for day in status["facts"]["sealed_days"])
+    assert all(item["source_day"] >= "2026-08-07" for item in status["facts"]["abandoned_days"])
 
 
 def test_driver_publishes_exactly_two_objects_and_records_the_structured_run_report(

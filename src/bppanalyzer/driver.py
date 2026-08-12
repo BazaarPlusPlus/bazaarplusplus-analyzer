@@ -89,6 +89,7 @@ class PipelineDriver:
         data_root: str | Path,
         *,
         source: Source,
+        source_epoch: date | str | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         settle_lag: timedelta = DEFAULT_SETTLE_LAG,
         heartbeat_interval: float = 30,
@@ -104,6 +105,7 @@ class PipelineDriver:
             raise ValueError("Settle lag must be positive")
         self.data_root = Path(data_root)
         self.source = source
+        self.source_epoch = parse_source_day(source_epoch) if source_epoch is not None else None
         self.clock = clock
         self.settle_lag = settle_lag
         self.heartbeat_interval = heartbeat_interval
@@ -205,7 +207,10 @@ class PipelineDriver:
                         bundles_total=bundles_total,
                         started_at=now,
                         now=_aware_utc(self.clock()),
-                        considered_days=healing_days(now, heal_days),
+                        considered_days=healing_days(
+                            now, heal_days, source_epoch=self.source_epoch
+                        ),
+                        source_epoch=self.source_epoch,
                         ownership_check=lock.assert_owned,
                     )
                 except LockOwnershipLost:
@@ -231,7 +236,9 @@ class PipelineDriver:
                     checkpoint=checkpoint,
                 )
                 build_started = time.monotonic()
-                window = select_analysis_window(store.seals(), parsed_anchor)
+                window = select_analysis_window(
+                    store.seals(), parsed_anchor, source_epoch=self.source_epoch
+                )
                 run_report = self._publish_products(
                     store,
                     window,
@@ -296,7 +303,8 @@ class PipelineDriver:
                     store,
                     summary,
                     now=_aware_utc(self.clock()),
-                    considered_days=healing_days(now, heal_days),
+                    considered_days=healing_days(now, heal_days, source_epoch=self.source_epoch),
+                    source_epoch=self.source_epoch,
                 )
                 _write_status(self.data_root, status, ownership_check)
                 _append_run(self.data_root, summary.to_dict(), ownership_check)
@@ -323,7 +331,7 @@ class PipelineDriver:
     ) -> dict[str, Any]:
         result = _empty_report(window, progress)
         if window is None:
-            report("publication skipped: no complete seven-day Analysis Window")
+            report("publication skipped: no Complete Source Day available for Analysis Window")
             return result
         builder = SnapshotBuilder(
             self.data_root,
@@ -387,7 +395,7 @@ class PipelineDriver:
     ) -> RunSummary:
         heal_started = time.monotonic()
         progress.heal_started_monotonic = heal_started
-        days = healing_days(now, heal_days)
+        days = healing_days(now, heal_days, source_epoch=self.source_epoch)
         planned_by_day: dict[date, tuple[datetime, ...]] = {}
         for day in days:
             if store.has_seal(day) or store.is_abandoned(day):
@@ -554,11 +562,18 @@ class PipelineDriver:
         )
 
 
-def healing_days(now: datetime, count: int) -> tuple[date, ...]:
+def healing_days(
+    now: datetime, count: int, *, source_epoch: date | str | None = None
+) -> tuple[date, ...]:
     """Return the oldest-first UTC Source Days considered by an invocation."""
     current = _aware_utc(now).date()
     first = current - timedelta(days=count - 1)
-    return tuple(first + timedelta(days=offset) for offset in range(count))
+    epoch = parse_source_day(source_epoch) if source_epoch is not None else None
+    return tuple(
+        day
+        for offset in range(count)
+        if (day := first + timedelta(days=offset)) >= (epoch or first)
+    )
 
 
 def is_hour_settled(
@@ -594,14 +609,28 @@ def build_status(
     *,
     now: datetime,
     considered_days: tuple[date, ...] | None = None,
+    source_epoch: date | str | None = None,
 ) -> dict[str, Any]:
     root = Path(data_root)
-    seals = store.seals()
-    abandoned = store.abandoned_days()
+    epoch = parse_source_day(source_epoch) if source_epoch is not None else None
+    seals = tuple(
+        item
+        for item in store.seals()
+        if epoch is None or parse_source_day(item.source_day) >= epoch
+    )
+    abandoned = tuple(
+        item
+        for item in store.abandoned_days()
+        if epoch is None or parse_source_day(item.source_day) >= epoch
+    )
     if considered_days is None:
         candidate_days = {date.fromisoformat(value[:10]) for value in store.committed_hours()}
         candidate_days.update(date.fromisoformat(item.source_day) for item in abandoned)
-        considered_days = tuple(sorted(candidate_days))
+        considered_days = tuple(
+            sorted(day for day in candidate_days if epoch is None or day >= epoch)
+        )
+    elif epoch is not None:
+        considered_days = tuple(day for day in considered_days if day >= epoch)
     sealed_days = {item.source_day for item in seals}
     abandoned_days = {item.source_day for item in abandoned}
     incomplete = []
@@ -645,12 +674,18 @@ def build_status(
     }
 
 
-def read_status(data_root: str | Path) -> dict[str, Any]:
+def read_status(data_root: str | Path, *, source_epoch: date | str | None = None) -> dict[str, Any]:
     path = Path(data_root) / "status.json"
     try:
         value = json.loads(path.read_bytes())
     except FileNotFoundError:
-        return build_status(data_root, FactStore(data_root), None, now=datetime.now(UTC))
+        return build_status(
+            data_root,
+            FactStore(data_root),
+            None,
+            now=datetime.now(UTC),
+            source_epoch=source_epoch,
+        )
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
         raise RuntimeError("status.json is unreadable") from error
     if not isinstance(value, dict):
@@ -768,6 +803,7 @@ def _write_current_status(
     started_at: datetime,
     now: datetime,
     considered_days: tuple[date, ...],
+    source_epoch: date | None,
     ownership_check: Callable[[], None],
 ) -> None:
     previous: dict[str, Any] = {}
@@ -783,6 +819,7 @@ def _write_current_status(
         None,
         now=now,
         considered_days=considered_days,
+        source_epoch=source_epoch,
     )
     status["last_run"] = previous.get("last_run")
     current_run: dict[str, Any] = {

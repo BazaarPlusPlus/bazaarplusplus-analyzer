@@ -26,35 +26,68 @@ def _seal(day: date) -> DaySeal:
     return DaySeal(day.isoformat(), (), {}, day.isoformat(), reused=True)
 
 
-def test_analysis_window_is_exactly_seven_consecutive_complete_source_days() -> None:
+@pytest.mark.parametrize("count", (1, 5, 7))
+def test_analysis_window_grows_from_one_to_seven_complete_source_days(count: int) -> None:
     start = date(2026, 8, 1)
-    six = tuple(_seal(start + timedelta(days=offset)) for offset in range(6))
-    assert select_analysis_window(six) is None
+    seals = tuple(_seal(start + timedelta(days=offset)) for offset in range(count))
 
-    seals = (
-        *six,
-        _seal(start + timedelta(days=6)),
-        _seal(start + timedelta(days=8)),
-    )
     selected = select_analysis_window(seals)
 
     assert selected is not None
-    assert selected.start == date(2026, 8, 1)
-    assert selected.end == date(2026, 8, 7)
+    assert selected.start == start
+    assert selected.end == start + timedelta(days=count - 1)
+    assert len(selected.seals) == count
+    assert selected.value["days"] == count
+
+
+def test_analysis_window_keeps_only_the_latest_seven_consecutive_days() -> None:
+    start = date(2026, 8, 1)
+    seals = tuple(_seal(start + timedelta(days=offset)) for offset in range(9))
+
+    selected = select_analysis_window(seals)
+
+    assert selected is not None
+    assert selected.start == date(2026, 8, 3)
+    assert selected.end == date(2026, 8, 9)
     assert len(selected.seals) == 7
     with pytest.raises(AnalysisWindowError, match="Duplicate"):
         select_analysis_window((*seals, seals[0]))
 
 
-def test_explicit_window_anchor_still_requires_exactly_seven_days() -> None:
+def test_explicit_window_anchor_uses_the_available_consecutive_suffix() -> None:
     start = date(2026, 8, 1)
     seals = tuple(_seal(start + timedelta(days=offset)) for offset in range(8))
 
-    assert select_analysis_window(seals, start + timedelta(days=5)) is None
+    selected = select_analysis_window(seals, start + timedelta(days=5))
+    assert selected is not None
+    assert selected.start == start
+    assert selected.end == start + timedelta(days=5)
+    assert selected.value["days"] == 6
+
     selected = select_analysis_window(seals, start + timedelta(days=7))
     assert selected is not None
     assert selected.start == start + timedelta(days=1)
     assert selected.end == start + timedelta(days=7)
+
+
+def test_analysis_window_never_considers_seals_before_the_source_epoch() -> None:
+    start = date(2026, 8, 1)
+    seals = tuple(_seal(start + timedelta(days=offset)) for offset in range(9))
+
+    selected = select_analysis_window(seals, source_epoch=date(2026, 8, 7))
+
+    assert selected is not None
+    assert selected.start == date(2026, 8, 7)
+    assert selected.end == date(2026, 8, 9)
+    assert selected.value["days"] == 3
+    assert (
+        select_analysis_window(
+            seals,
+            anchor_day=date(2026, 8, 6),
+            source_epoch=date(2026, 8, 7),
+        )
+        is None
+    )
 
 
 def test_heroes_snapshot_is_daily_additive_and_matches_the_strict_contract(
@@ -112,6 +145,19 @@ def test_heroes_snapshot_is_daily_additive_and_matches_the_strict_contract(
     assert empty["matchups"] == []
     assert built.stats.participating_runs == 7
     assert built.stats.participating_matchup_battles == 56
+
+
+def test_heroes_schema_requires_days_length_to_equal_window_days(
+    canonical_fact_store,
+) -> None:
+    root, store = canonical_fact_store
+    window = select_analysis_window(store.seals())
+    assert window is not None
+    payload = json.loads(SnapshotBuilder(root, store=store).build_heroes(window).content)
+    payload["window"]["days"] = 6
+    schema = json.loads(Path("contracts/v5/heroes.schema.json").read_bytes())
+
+    assert list(Draft202012Validator(schema).iter_errors(payload))
 
 
 def test_builds_snapshot_matches_mod_schema_and_has_bidirectional_card_index(

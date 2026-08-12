@@ -11,7 +11,7 @@
     "window": {"$ref": "#/$defs/window"},
     "days": {
       "type": "array",
-      "minItems": 7,
+      "minItems": 1,
       "maxItems": 7,
       "items": {
         "type": "object",
@@ -29,6 +29,36 @@
       }
     }
   },
+  "allOf": [
+    {
+      "if": {"properties": {"window": {"properties": {"days": {"const": 1}}}}},
+      "then": {"properties": {"days": {"minItems": 1, "maxItems": 1}}}
+    },
+    {
+      "if": {"properties": {"window": {"properties": {"days": {"const": 2}}}}},
+      "then": {"properties": {"days": {"minItems": 2, "maxItems": 2}}}
+    },
+    {
+      "if": {"properties": {"window": {"properties": {"days": {"const": 3}}}}},
+      "then": {"properties": {"days": {"minItems": 3, "maxItems": 3}}}
+    },
+    {
+      "if": {"properties": {"window": {"properties": {"days": {"const": 4}}}}},
+      "then": {"properties": {"days": {"minItems": 4, "maxItems": 4}}}
+    },
+    {
+      "if": {"properties": {"window": {"properties": {"days": {"const": 5}}}}},
+      "then": {"properties": {"days": {"minItems": 5, "maxItems": 5}}}
+    },
+    {
+      "if": {"properties": {"window": {"properties": {"days": {"const": 6}}}}},
+      "then": {"properties": {"days": {"minItems": 6, "maxItems": 6}}}
+    },
+    {
+      "if": {"properties": {"window": {"properties": {"days": {"const": 7}}}}},
+      "then": {"properties": {"days": {"minItems": 7, "maxItems": 7}}}
+    }
+  ],
   "$defs": {
     "count": {"type": "integer", "minimum": 0},
     "day": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
@@ -39,7 +69,7 @@
       "properties": {
         "start": {"$ref": "#/$defs/day"},
         "end": {"$ref": "#/$defs/day"},
-        "days": {"const": 7}
+        "days": {"type": "integer", "minimum": 1, "maximum": 7}
       }
     },
     "row": {

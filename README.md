@@ -8,11 +8,12 @@ analyzer-v5/heroes/latest.json
 analyzer-v5/builds/latest.json
 ```
 
-The Web snapshot contains seven newest-first daily partitions of additive
-integer Hero metrics for `legend` and `non_legend`. The Mod snapshot contains
-the current schema-2 Ten-Win Build corpus with deterministic lookup tables and
-card indices. Both use the latest seven consecutive Complete Source Days and
-are calculated, validated, and replaced independently.
+The Web snapshot contains one to seven newest-first daily partitions of
+additive integer Hero metrics for `legend` and `non_legend`. The Mod snapshot
+contains the current schema-2 Ten-Win Build corpus with deterministic lookup
+tables and card indices. Both use the latest consecutive Complete Source Days,
+up to seven, and are calculated, validated, and replaced independently. One
+complete day is sufficient to publish.
 
 ## Operator commands
 
@@ -23,8 +24,10 @@ uv run bpp status --json
 uv run bpp verify --deep
 ```
 
-Configuration is read from the repository `.env`. `--no-publish` does not
-construct an R2 adapter. Tests use only fake/local object stores.
+Configuration is read from the repository `.env`. Optional
+`BPP_SOURCE_EPOCH=YYYY-MM-DD` excludes every earlier UTC Source Day from
+healing, sealing, and analysis. `--no-publish` does not construct an R2
+adapter. Tests use only fake/local object stores.
 
 The authoritative domain vocabulary is in `CONTEXT.md`; the wire and metric
 contract is in `docs/specs/consumer-data-contract.md`; strict schemas are in

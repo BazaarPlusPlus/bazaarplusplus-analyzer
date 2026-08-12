@@ -1,3 +1,4 @@
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -65,4 +66,16 @@ def test_missing_env_and_source_configuration_are_rejected(tmp_path: Path) -> No
         load_config(root=tmp_path)
     (tmp_path / ".env").write_text("BPP_DATA_ROOT=data\n")
     with pytest.raises(ConfigurationError, match="Bundle Server"):
+        load_config(root=tmp_path)
+
+
+def test_source_epoch_is_optional_and_parsed_as_a_strict_utc_date(tmp_path: Path) -> None:
+    _write_env(tmp_path)
+    assert load_config(root=tmp_path).source_epoch is None
+
+    _write_env(tmp_path, "BPP_SOURCE_EPOCH=2026-08-07\n")
+    assert load_config(root=tmp_path).source_epoch == date(2026, 8, 7)
+
+    _write_env(tmp_path, "BPP_SOURCE_EPOCH=2026-8-7\n")
+    with pytest.raises(ConfigurationError, match="BPP_SOURCE_EPOCH.*YYYY-MM-DD"):
         load_config(root=tmp_path)

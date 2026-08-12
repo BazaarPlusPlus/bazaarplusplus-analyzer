@@ -6,8 +6,10 @@ object-store adapter. Tests never contact the Bundle Server or R2.
 | Contract behavior | Runnable evidence |
 | --- | --- |
 | Unknown hero/rank cascade removes Run, Battles, and Cards | `tests/test_projection.py::test_unaccepted_run_is_discarded_with_all_battles_and_cards` |
-| Complete window is consecutive and exactly seven days | `tests/test_publication.py::test_analysis_window_is_exactly_seven_consecutive_complete_source_days` |
-| Fewer than seven days never publishes | `tests/test_driver.py::test_fewer_than_seven_complete_days_never_publish_a_growing_window` |
+| Complete window grows through 1, 5, and 7 consecutive days | `tests/test_publication.py::test_analysis_window_grows_from_one_to_seven_complete_source_days` |
+| More than seven days selects the latest seven | `tests/test_publication.py::test_analysis_window_keeps_only_the_latest_seven_consecutive_days` |
+| One Complete Source Day publishes | `tests/test_driver.py::test_one_complete_day_publishes_a_one_day_window` |
+| Source Epoch excludes earlier selection and healing | `tests/test_publication.py::test_analysis_window_never_considers_seals_before_the_source_epoch`, `tests/test_driver.py::test_source_epoch_prevents_pre_epoch_days_from_being_healed_or_considered` |
 | Hero rows are canonical, daily, additive, and preserve Matchups | `tests/test_publication.py::test_heroes_snapshot_is_daily_additive_and_matches_the_strict_contract` |
 | No `battle_days` or precomputed rate fields | strict `heroes.schema.json` plus the Hero payload test |
 | Build wire shape matches schema 2 | `tests/test_publication.py::test_builds_snapshot_matches_mod_schema_and_has_bidirectional_card_index` |
