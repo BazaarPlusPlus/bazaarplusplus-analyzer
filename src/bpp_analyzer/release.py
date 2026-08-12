@@ -246,6 +246,33 @@ def candidate_score(
     )
 
 
+def _candidate_score_sql() -> str:
+    proportion = "(ten_win::DOUBLE / completed)"
+    z_squared = WILSON_Z * WILSON_Z
+    wilson = (
+        f"(({proportion} + {z_squared!r} / (2 * completed) "
+        f"- {WILSON_Z!r} * sqrt({proportion} * (1 - {proportion}) / completed "
+        f"+ {z_squared!r} / (4 * completed * completed))) "
+        f"/ (1 + {z_squared!r} / completed))"
+    )
+    average_day = (
+        "CASE WHEN day_count=0 OR day_sum=0 THEN 10.0 "
+        "ELSE day_sum::DOUBLE / day_count END"
+    )
+    average_losses = (
+        "CASE WHEN loss_count=0 OR loss_sum=0 THEN 0.0 "
+        "ELSE loss_sum::DOUBLE / loss_count END"
+    )
+    return (
+        "CAST(floor("
+        f"{EVIDENCE_WEIGHT} * ln(1 + ten_win) * {wilson} "
+        f"+ {LEGEND_WEIGHT} * ln(1 + legend_ten_win) "
+        f"+ {SPEED_WEIGHT} * 10.0 / greatest({average_day}, 10.0) "
+        f"+ {STABILITY_WEIGHT} / (1.0 + {average_losses}) "
+        "+ 0.5) AS BIGINT)"
+    )
+
+
 class ReleaseBuilder:
     """Own one DuckDB build connection and the releases/ promotion boundary."""
 
@@ -1018,69 +1045,216 @@ class _Analytics:
         )
 
     def builds(self) -> bytes:
-        candidates = self._rows(
-            f"""
-            WITH final_battles AS (
-              SELECT run_id, source_day, min(battle_id) AS battle_id, count(*) AS final_count
-              FROM battles_fact WHERE is_final_battle
-              GROUP BY run_id, source_day
-            ), layouts AS (
-              SELECT run_id, source_day, battle_id,
-                     list(lower(template_id) ORDER BY lower(template_id)) AS card_ids,
-                     list(struct_pack(
-                       template_id := lower(template_id),
-                       slot := coalesce(socket,slot_index), tier := tier,
-                       enchantment := enchantment, size := size
-                     ) ORDER BY coalesce(socket,slot_index),slot_index,lower(template_id),
-                                instance_id,tier,enchantment,size) AS layout
-              FROM battle_cards_fact
-              WHERE owner_side='player' AND card_kind='item'
-                AND card_set_label='player_hand'
-                AND lower(coalesce(card_set_status,'')) <> 'missing'
-              GROUP BY run_id, source_day, battle_id
-              HAVING count(*) > 0 AND count(size)=count(*) AND min(size)>0
-                 AND sum(size)=10 AND count(template_id)=count(*)
-                 AND count(coalesce(socket,slot_index))=count(*)
-                 AND bool_and(regexp_full_match(lower(template_id), '{_UUID_PATTERN}'))
-            ), valid AS (
-              SELECT r.run_id, r.hero_norm AS hero, r.available_at_ms, r.final_battle_id,
-                     r.victories, r.losses, r.run_day, r.final_rank,
-                     l.card_ids, l.layout
-              FROM analytic_runs r
-              JOIN final_battles f ON f.run_id=r.run_id AND f.source_day=r.source_day
-              JOIN layouts l ON l.run_id=r.run_id AND l.source_day=r.source_day
-                            AND l.battle_id=f.battle_id
-              WHERE lower(r.status)='completed' AND f.final_count=1
-                AND r.final_battle_id=f.battle_id
-                AND r.hero_norm IN ('Dooley','Jules','Karnok','Mak','Pygmalien','Stelle','TheDragons','Vanessa')
+        temporary_tables = ("build_pool", "build_candidates", "build_runs")
+        try:
+            self.connection.execute(
+                f"""
+                CREATE TEMP TABLE build_runs AS
+                WITH final_battles AS (
+                  SELECT run_id, source_day, min(battle_id) AS battle_id,
+                         count(*) AS final_count
+                  FROM battles_fact
+                  WHERE is_final_battle
+                  GROUP BY run_id, source_day
+                ), layout_keys AS (
+                  SELECT c.run_id, c.source_day, c.battle_id,
+                         string_agg(lower(c.template_id), '|'
+                           ORDER BY lower(c.template_id)) AS build_key
+                  FROM battle_cards_fact c
+                  JOIN final_battles f
+                    ON f.run_id=c.run_id AND f.source_day=c.source_day
+                   AND f.battle_id=c.battle_id AND f.final_count=1
+                  WHERE c.owner_side='player' AND c.card_kind='item'
+                    AND c.card_set_label='player_hand'
+                    AND lower(coalesce(c.card_set_status,'')) <> 'missing'
+                  GROUP BY c.run_id, c.source_day, c.battle_id
+                  HAVING count(*) > 0 AND count(c.size)=count(*) AND min(c.size)>0
+                     AND sum(c.size)=10 AND count(c.template_id)=count(*)
+                     AND count(coalesce(c.socket,c.slot_index))=count(*)
+                     AND bool_and(regexp_full_match(
+                       lower(c.template_id), '{_UUID_PATTERN}'))
+                )
+                SELECT r.run_id, r.source_day, r.hero_norm AS hero,
+                       r.available_at_ms, r.final_battle_id, r.victories,
+                       r.losses, r.run_day, r.final_rank, l.build_key
+                FROM analytic_runs r
+                JOIN layout_keys l
+                  ON l.run_id=r.run_id AND l.source_day=r.source_day
+                 AND l.battle_id=r.final_battle_id
+                WHERE lower(r.status)='completed'
+                  AND r.hero_norm IN (
+                    'Dooley','Jules','Karnok','Mak','Pygmalien','Stelle',
+                    'TheDragons','Vanessa'
+                  )
+                """
             )
-            SELECT hero, card_ids, count(*) AS completed,
-                   count(*) FILTER (WHERE victories=10 AND losses>=0) AS ten_win,
-                   coalesce(sum(run_day) FILTER (WHERE victories=10 AND losses>=0 AND run_day IS NOT NULL),0) AS day_sum,
-                   count(run_day) FILTER (WHERE victories=10 AND losses>=0) AS day_count,
-                   quantile_cont(run_day,0.75) FILTER (WHERE victories=10 AND losses>=0) AS p75_day,
-                   coalesce(sum(losses) FILTER (WHERE victories=10 AND losses>=0),0) AS loss_sum,
-                   count(losses) FILTER (WHERE victories=10 AND losses>=0) AS loss_count,
-                   count(*) FILTER (WHERE final_rank='Legendary') AS legend_completed,
-                   count(*) FILTER (WHERE final_rank='Legendary' AND victories=10 AND losses>=0) AS legend_ten_win,
-                   coalesce(sum(run_day) FILTER (WHERE final_rank='Legendary' AND victories=10 AND losses>=0 AND run_day IS NOT NULL),0) AS legend_day_sum,
-                   count(run_day) FILTER (WHERE final_rank='Legendary' AND victories=10 AND losses>=0) AS legend_day_count,
-                   arg_min(layout, struct_pack(
-                     null_day := run_day IS NULL, run_day := coalesce(run_day,0),
-                     available_at_ms := available_at_ms,
-                     final_battle_id := final_battle_id, run_id := run_id
-                   )) FILTER (WHERE victories=10 AND losses>=0) AS representative_layout
-            FROM valid
-            GROUP BY hero, card_ids
-            HAVING count(*) FILTER (WHERE victories=10 AND losses>=0) >= {MIN_TEN_WIN_RUNS}
-            ORDER BY hero, card_ids
-            """
-        )
+            self.connection.execute(
+                f"""
+                CREATE TEMP TABLE build_candidates AS
+                WITH aggregated AS (
+                  SELECT hero, build_key, count(*) AS completed,
+                         count(*) FILTER (
+                           WHERE victories=10 AND losses>=0
+                         ) AS ten_win,
+                         coalesce(sum(run_day) FILTER (
+                           WHERE victories=10 AND losses>=0
+                             AND run_day IS NOT NULL
+                         ),0) AS day_sum,
+                         count(run_day) FILTER (
+                           WHERE victories=10 AND losses>=0
+                         ) AS day_count,
+                         quantile_cont(run_day,0.75) FILTER (
+                           WHERE victories=10 AND losses>=0
+                         ) AS p75_day,
+                         coalesce(sum(losses) FILTER (
+                           WHERE victories=10 AND losses>=0
+                         ),0) AS loss_sum,
+                         count(losses) FILTER (
+                           WHERE victories=10 AND losses>=0
+                         ) AS loss_count,
+                         count(*) FILTER (
+                           WHERE final_rank='Legendary'
+                         ) AS legend_completed,
+                         count(*) FILTER (
+                           WHERE final_rank='Legendary'
+                             AND victories=10 AND losses>=0
+                         ) AS legend_ten_win,
+                         coalesce(sum(run_day) FILTER (
+                           WHERE final_rank='Legendary'
+                             AND victories=10 AND losses>=0
+                             AND run_day IS NOT NULL
+                         ),0) AS legend_day_sum,
+                         count(run_day) FILTER (
+                           WHERE final_rank='Legendary'
+                             AND victories=10 AND losses>=0
+                         ) AS legend_day_count,
+                         arg_min(
+                           struct_pack(
+                             run_id := run_id, source_day := source_day,
+                             battle_id := final_battle_id
+                           ),
+                           struct_pack(
+                             null_day := run_day IS NULL,
+                             run_day := coalesce(run_day,0),
+                             available_at_ms := available_at_ms,
+                             source_day := source_day,
+                             final_battle_id := final_battle_id,
+                             run_id := run_id
+                           )
+                         ) FILTER (
+                           WHERE victories=10 AND losses>=0
+                         ) AS representative
+                  FROM build_runs
+                  GROUP BY hero, build_key
+                  HAVING count(*) FILTER (
+                    WHERE victories=10 AND losses>=0
+                  ) >= {MIN_TEN_WIN_RUNS}
+                )
+                SELECT *, {_candidate_score_sql()} AS score
+                FROM aggregated
+                """
+            )
+            self.connection.execute(
+                f"""
+                CREATE TEMP TABLE build_pool AS
+                WITH ranked AS (
+                  SELECT hero, build_key,
+                         row_number() OVER (
+                           PARTITION BY hero ORDER BY score DESC, build_key
+                         ) AS core_rank
+                  FROM build_candidates
+                ), candidate_cards AS (
+                  SELECT hero, build_key, score,
+                         unnest(string_split(build_key, '|')) AS card_id
+                  FROM build_candidates
+                ), best_by_card AS (
+                  SELECT hero, build_key
+                  FROM (
+                    SELECT hero, build_key,
+                           row_number() OVER (
+                             PARTITION BY hero, card_id
+                             ORDER BY score DESC, build_key
+                           ) AS card_rank
+                    FROM candidate_cards
+                  )
+                  WHERE card_rank=1
+                )
+                SELECT hero, build_key FROM ranked
+                WHERE core_rank <= {CORE_BUILD_LIMIT_PER_HERO}
+                UNION
+                SELECT hero, build_key FROM best_by_card
+                """
+            )
+
+            candidate_counts = {
+                hero: int(count)
+                for hero, count in self._rows(
+                    """
+                    SELECT hero, count(*) FROM build_candidates
+                    GROUP BY hero ORDER BY hero
+                    """
+                )
+            }
+            cards_by_hero: dict[str, set[str]] = {}
+            for hero, card in self._rows(
+                """
+                SELECT hero, card_id
+                FROM build_candidates,
+                     unnest(string_split(build_key, '|')) AS cards(card_id)
+                GROUP BY hero, card_id
+                ORDER BY hero, card_id
+                """
+            ):
+                cards_by_hero.setdefault(hero, set()).add(card)
+
+            candidates = self._rows(
+                """
+                SELECT c.hero, c.build_key, c.completed, c.ten_win,
+                       c.day_sum, c.day_count, c.p75_day,
+                       c.loss_sum, c.loss_count, c.legend_completed,
+                       c.legend_ten_win, c.legend_day_sum,
+                       c.legend_day_count, c.score
+                FROM build_candidates c
+                JOIN build_pool p USING (hero, build_key)
+                ORDER BY c.hero, c.score DESC, c.build_key
+                """
+            )
+            layout_values = {
+                (hero, build_key): layout
+                for hero, build_key, layout in self._rows(
+                    """
+                    SELECT p.hero, p.build_key,
+                           list(struct_pack(
+                             template_id := lower(c.template_id),
+                             slot := coalesce(c.socket,c.slot_index),
+                             tier := c.tier, enchantment := c.enchantment,
+                             size := c.size
+                           ) ORDER BY coalesce(c.socket,c.slot_index),
+                                      c.slot_index,lower(c.template_id),
+                                      c.instance_id,c.tier,c.enchantment,c.size)
+                    FROM build_pool p
+                    JOIN build_candidates b USING (hero, build_key)
+                    JOIN battle_cards_fact c
+                      ON c.run_id=b.representative.run_id
+                     AND c.source_day=b.representative.source_day
+                     AND c.battle_id=b.representative.battle_id
+                    WHERE c.owner_side='player' AND c.card_kind='item'
+                      AND c.card_set_label='player_hand'
+                      AND lower(coalesce(c.card_set_status,'')) <> 'missing'
+                    GROUP BY p.hero, p.build_key
+                    ORDER BY p.hero, p.build_key
+                    """
+                )
+            }
+        finally:
+            for table in temporary_tables:
+                self.connection.execute(f"DROP TABLE IF EXISTS {table}")
+
         scored_by_hero: dict[str, list[dict[str, Any]]] = {}
         for row in candidates:
             (
                 hero,
-                card_ids,
+                build_key,
                 completed,
                 ten_win,
                 day_sum,
@@ -1092,13 +1266,13 @@ class _Analytics:
                 legend_ten_win,
                 legend_day_sum,
                 legend_day_count,
-                layout,
+                sql_score,
             ) = row
             average_day = int(day_sum) / int(day_count) if day_count else None
             average_losses = int(loss_sum) / int(loss_count) if loss_count else None
             candidate = {
                 "hero": hero,
-                "card_ids": tuple(card_ids),
+                "card_ids": tuple(build_key.split("|")),
                 "completed": int(completed),
                 "ten_win": int(ten_win),
                 "average_day": average_day,
@@ -1109,7 +1283,7 @@ class _Analytics:
                 "legend_average_day": (
                     int(legend_day_sum) / int(legend_day_count) if legend_day_count else None
                 ),
-                "layout": layout,
+                "layout": layout_values[(hero, build_key)],
             }
             candidate["score"] = candidate_score(
                 completed=candidate["completed"],
@@ -1118,6 +1292,8 @@ class _Analytics:
                 average_day=average_day,
                 average_losses=average_losses,
             )
+            if candidate["score"] != int(sql_score):
+                raise ReleaseBuildError("DuckDB and Python candidate scores differ")
             scored_by_hero.setdefault(hero, []).append(candidate)
         for values in scored_by_hero.values():
             values.sort(key=lambda item: (-item["score"], item["card_ids"]))
@@ -1127,7 +1303,7 @@ class _Analytics:
             scored = scored_by_hero[hero]
             selected = [(candidate, 0, None) for candidate in scored[:CORE_BUILD_LIMIT_PER_HERO]]
             selected_ids = {candidate["card_ids"] for candidate, _reason, _card in selected}
-            pool_cards = {card for candidate in scored for card in candidate["card_ids"]}
+            pool_cards = cards_by_hero[hero]
             covered = {card for candidate, _reason, _card in selected for card in candidate["card_ids"]}
             for card in sorted(pool_cards - covered):
                 if card in covered:
@@ -1140,7 +1316,7 @@ class _Analytics:
             selected_by_hero[hero] = selected
 
         card_table = sorted(
-            {card for values in scored_by_hero.values() for candidate in values for card in candidate["card_ids"]}
+            {card for values in cards_by_hero.values() for card in values}
         )
         card_ref = {card: index for index, card in enumerate(card_table)}
         enchantment_names = sorted(
@@ -1158,7 +1334,7 @@ class _Analytics:
         for hero in sorted(scored_by_hero):
             scored = scored_by_hero[hero]
             selected = selected_by_hero[hero]
-            pool_cards = {card for candidate in scored for card in candidate["card_ids"]}
+            pool_cards = cards_by_hero[hero]
             covered = {card for candidate, _reason, _card in selected for card in candidate["card_ids"]}
             build_rows = [
                 _build_row(candidate, reason, covered_card, card_ref, enchant_ref)
@@ -1171,7 +1347,7 @@ class _Analytics:
             heroes.append(
                 {
                     "hero": hero,
-                    "candidate_build_count": len(scored),
+                    "candidate_build_count": candidate_counts[hero],
                     "candidate_card_count": len(pool_cards),
                     "included_build_count": len(selected),
                     "covered_card_count": len(covered & pool_cards),
