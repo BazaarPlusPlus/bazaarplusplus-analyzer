@@ -105,6 +105,7 @@ def test_acceptance_1_and_8_second_run_is_a_cheap_nonmutating_noop(
     assert status["release"]["published_release_id"] == first.release_published
     assert status["release"]["published_window_end"] == "2026-08-07"
     assert status["release"]["published_manifest_age_seconds"] == 0.0
+    assert status["release"]["pointer_state"] == "ok"
 
 
 def test_no_publish_builds_locally_and_performs_no_object_store_write(
@@ -124,6 +125,9 @@ def test_no_publish_builds_locally_and_performs_no_object_store_write(
 
     assert result.release_built is not None
     assert result.release_published is None
+    status = json.loads((root / "status.json").read_bytes())
+    assert status["release"]["pointer_state"] == "absent"
+    assert status["release"]["published_release_id"] is None
     assert [(item.operation, item.key) for item in objects.requests] == [
         ("get", POINTER_KEY)
     ]
@@ -155,6 +159,7 @@ def test_status_fallback_retains_authoritative_pointer_fields(
     status = json.loads((root / "status.json").read_bytes())
     assert status["release"] == {
         "local_newest_release_id": first.release_published,
+        "pointer_state": "ok",
         "publish_hold": False,
         "published_manifest_age_seconds": 3600.0,
         "published_release_id": first.release_published,

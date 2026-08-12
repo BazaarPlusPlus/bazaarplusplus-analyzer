@@ -261,7 +261,9 @@ bpp show release <release_id>
 - `run` — heal → seal → build → publish → report. Default `--heal-days 8`;
   healing is clamped at the epoch day 2026-08-07 and never reaches before it.
 - `--anchor-day` — anchor the release at an explicit sealed day.
-- `--no-publish` — everything except R2 writes.
+- `--no-publish` — everything except R2 writes. The pointer `GET` still records
+  public state; a legacy or otherwise unparseable pointer is a warning, not a
+  run failure, because publication is not attempted.
 - `--dry-run` — report the plan; write nothing; network = pointer `GET` only.
 - `verify` — recompute Parquet hashes against `_commit.json`; `--deep` also
   revalidates local releases against `contracts/v5/`. Operator tool, not run
@@ -278,6 +280,9 @@ Exit codes: 0 success/no-op · 1 unexpected · 2 usage · 3 lock held ·
 run: it writes nothing. Permanently unrecoverable conditions (abandoned days)
 are recorded once and stop affecting exit codes. The single real alarm is the
 age of `analyzer-v5/manifest.json`, monitored **off this machine**.
+An eligible publication blocked by an invalid current pointer is `error`, exit
+1: it requires persistent operator attention and is not a retryable hour
+failure (`partial`, exit 4).
 
 ## Disk layout
 
@@ -371,7 +376,8 @@ makes long outages survivable instead of infinitely retried.
 `status.json` (atomic, rewritten every run including failures):
 `facts` {newest_sealed_day, sealed_days, incomplete_days (with missing hours,
 settled flag), abandoned_days}, `release` {publish_hold, local_newest_release_id,
-published_release_id, published_window_end, published_manifest_age_seconds},
+pointer_state ∈ ok|legacy_or_unparseable|absent, published_release_id,
+published_window_end, published_manifest_age_seconds},
 `last_run` {run_id, timings, outcome ∈ ok|noop|partial|error, exit_code,
 hours_ingested, days_sealed, release_built, release_published, failures[]},
 `disk` free-bytes, `peak_rss_bytes`. `published_*` always comes from the
@@ -523,7 +529,9 @@ the check is removed.
 **Publish**
 12. The current pointer parses; its `release_id` matches the frozen pattern
     and is prefixed by its own window end. Unparseable pointer blocks
-    publication.
+    publication. If publication is gated off (`--no-publish` or
+    `publish-hold.json`), record `legacy_or_unparseable` plus a warning and do
+    not fail the otherwise successful/no-op run.
 13. Anti-regression: new window end `>=` published window end (`>=` so a
     corrected same-anchor release ships). Only `rollback` moves backward.
 14. Immutable-key conflict (differing bytes at an existing release key) is a
@@ -582,7 +590,9 @@ is no gradual migration. The legacy stack keeps running untouched until step 5.
 3. Run `bpp run --no-publish` alongside the legacy stack for several days:
    sanity-check the new numbers against legacy output where windows overlap
    (semantic spot-checks, not byte comparison — there is nothing to be
-   byte-equal to).
+   byte-equal to). The still-legacy public pointer is expected here: each run
+   records `pointer_state: legacy_or_unparseable` and warns, but its outcome is
+   determined by the heal/seal/build work rather than failing check 12.
 4. The flip, as one coordinated change: consumers deploy support for the new
    payloads, the legacy scheduler is stopped, and the first `bpp run` publish
    replaces `analyzer-v5/manifest.json` with the new-format pointer. Legacy

@@ -26,6 +26,7 @@ from bpp_analyzer.object_store import ObjectStore
 from bpp_analyzer.projection import project_hour
 from bpp_analyzer.release import (
     EPOCH_DAY,
+    InvalidPointer,
     PublishedPointer,
     RELEASE_ID_PATTERN,
     ReleaseBuilder,
@@ -38,6 +39,9 @@ from bpp_analyzer.release import (
 
 DEFAULT_HEAL_DAYS = 8
 DEFAULT_SETTLE_LAG = timedelta(seconds=60)
+POINTER_STATE_OK = "ok"
+POINTER_STATE_LEGACY_OR_UNPARSEABLE = "legacy_or_unparseable"
+POINTER_STATE_ABSENT = "absent"
 
 
 class Source(Protocol):
@@ -163,6 +167,7 @@ class PipelineDriver:
             progress = _RunProgress()
             summary: RunSummary | None = None
             published_pointer: PublishedPointer | None = None
+            pointer_state: str | None = None
             run_log: _RunLog | None = None
             pending_error: BaseException | None = None
             pending_traceback = None
@@ -217,6 +222,7 @@ class PipelineDriver:
                             now=_aware_utc(self.clock()),
                             considered_days=healing_days(now, heal_days),
                             published_pointer=published_pointer,
+                            pointer_state=pointer_state,
                             ownership_check=lock.assert_owned,
                         )
                     except LockOwnershipLost:
@@ -280,17 +286,37 @@ class PipelineDriver:
                     checkpoint("publish", None)
                     pointer_started = time.monotonic()
                     report("publish pointer check started")
-                    published_pointer = publisher.current_pointer()
-                    report(
-                        "publish pointer check done: published_release_id="
-                        f"{published_pointer.release_id if published_pointer else 'none'} "
-                        f"elapsed={_format_elapsed(time.monotonic() - pointer_started)}"
-                    )
                     hold = (self.data_root / "publish-hold.json").is_file()
+                    publish_candidate = local is not None and publish and not hold
+                    try:
+                        published_pointer = publisher.current_pointer()
+                    except InvalidPointer:
+                        pointer_state = POINTER_STATE_LEGACY_OR_UNPARSEABLE
+                        report(
+                            "publish pointer check done: published_release_id=none "
+                            f"elapsed={_format_elapsed(time.monotonic() - pointer_started)} "
+                            f"pointer_state={pointer_state}"
+                        )
+                        if publish_candidate:
+                            raise
+                        report(
+                            "warning: public pointer is legacy or unparseable; "
+                            "publication was not attempted"
+                        )
+                    else:
+                        pointer_state = (
+                            POINTER_STATE_OK
+                            if published_pointer is not None
+                            else POINTER_STATE_ABSENT
+                        )
+                        report(
+                            "publish pointer check done: published_release_id="
+                            f"{published_pointer.release_id if published_pointer else 'none'} "
+                            f"elapsed={_format_elapsed(time.monotonic() - pointer_started)} "
+                            f"pointer_state={pointer_state}"
+                        )
                     if (
-                        local is not None
-                        and publish
-                        and not hold
+                        publish_candidate
                         and (
                             published_pointer is None
                             or local.release_id != published_pointer.release_id
@@ -303,6 +329,7 @@ class PipelineDriver:
                             current=published_pointer,
                         )
                         published_pointer = published.pointer
+                        pointer_state = POINTER_STATE_OK
                         report(
                             f"publish done: release_id={local.release_id} "
                             f"uploaded={published.uploaded} skipped={published.skipped} "
@@ -387,6 +414,7 @@ class PipelineDriver:
                         now=_aware_utc(self.clock()),
                         considered_days=healing_days(now, heal_days),
                         published_pointer=published_pointer,
+                        pointer_state=pointer_state,
                         ownership_check=finalization_ownership_check,
                         run_log=run_log,
                     )
@@ -610,6 +638,7 @@ def build_status(
     now: datetime,
     considered_days: tuple[date, ...] | None = None,
     published_pointer: PublishedPointer | None = None,
+    pointer_state: str | None = None,
 ) -> dict[str, Any]:
     root = Path(data_root)
     seals = store.seals()
@@ -648,6 +677,11 @@ def build_status(
         if published_pointer is not None
         else None
     )
+    observed_pointer_state = pointer_state or (
+        POINTER_STATE_OK
+        if published_pointer is not None
+        else POINTER_STATE_ABSENT
+    )
     return {
         "facts": {
             "newest_sealed_day": max(sealed_days, default=None),
@@ -666,6 +700,7 @@ def build_status(
         "release": {
             "publish_hold": (root / "publish-hold.json").is_file(),
             "local_newest_release_id": local_newest_release_id(root),
+            "pointer_state": observed_pointer_state,
             "published_release_id": (
                 published_pointer.release_id if published_pointer is not None else None
             ),
@@ -717,6 +752,7 @@ def _write_current_status(
     now: datetime,
     considered_days: tuple[date, ...],
     published_pointer: PublishedPointer | None,
+    pointer_state: str | None,
     ownership_check: Callable[[], None],
 ) -> None:
     previous: dict[str, Any] = {}
@@ -734,10 +770,16 @@ def _write_current_status(
         now=now,
         considered_days=considered_days,
         published_pointer=published_pointer,
+        pointer_state=pointer_state,
     )
     status["last_run"] = previous.get("last_run")
-    if published_pointer is None and isinstance(previous.get("release"), dict):
+    if (
+        pointer_state is None
+        and published_pointer is None
+        and isinstance(previous.get("release"), dict)
+    ):
         for field in (
+            "pointer_state",
             "published_release_id",
             "published_window_end",
             "published_manifest_age_seconds",
@@ -831,6 +873,7 @@ def _write_run_reports(
     now: datetime,
     considered_days: tuple[date, ...],
     published_pointer: PublishedPointer | None,
+    pointer_state: str | None,
     ownership_check: Callable[[], None],
     run_log: _RunLog | None,
 ) -> tuple[RunSummary, BaseException | None]:
@@ -844,6 +887,7 @@ def _write_run_reports(
             now=now,
             considered_days=considered_days,
             published_pointer=published_pointer,
+            pointer_state=pointer_state,
         )
     except LockOwnershipLost:
         raise
@@ -863,6 +907,7 @@ def _write_run_reports(
                 root,
                 summary,
                 published_pointer,
+                pointer_state,
                 now=now,
             )
         except LockOwnershipLost:
@@ -892,6 +937,7 @@ def _error_status(
     root: Path,
     summary: RunSummary,
     published_pointer: PublishedPointer | None = None,
+    pointer_state: str | None = None,
     *,
     now: datetime,
 ) -> dict[str, Any]:
@@ -913,6 +959,11 @@ def _error_status(
         "release": {
             "publish_hold": (root / "publish-hold.json").is_file(),
             "local_newest_release_id": local_newest_release_id(root),
+            "pointer_state": pointer_state or (
+                POINTER_STATE_OK
+                if published_pointer is not None
+                else POINTER_STATE_ABSENT
+            ),
             "published_release_id": (
                 published_pointer.release_id if published_pointer is not None else None
             ),
