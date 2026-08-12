@@ -15,7 +15,6 @@ from bppanalyzer.bundle_source import (
     raw_commit_sha256,
 )
 from bppanalyzer.driver import (
-    EPOCH_DAY,
     PipelineDriver,
     healing_days,
     is_hour_settled,
@@ -150,6 +149,9 @@ def test_one_source_day_persists_only_parquet_plus_at_most_one_percent_metadata(
                         "run_id": None,
                         "stage": "bundle_validation",
                         "reason_code": "fixture",
+                        "raw_run": False,
+                        "discarded_unknown_hero": False,
+                        "discarded_unknown_final_rank": False,
                         "first_seen_at": "2026-08-10T01:00:00Z",
                         "decoder_code_version": "fixture",
                         "diagnostic_json": os.urandom(6 * 1024 * 1024).hex(),
@@ -174,10 +176,18 @@ def test_one_source_day_persists_only_parquet_plus_at_most_one_percent_metadata(
     assert not (tmp_path / "raw").exists()
 
 
-def test_healing_is_epoch_clamped_oldest_first_and_settlement_is_a_pure_boundary() -> None:
+def test_healing_is_oldest_first_and_settlement_is_a_pure_boundary() -> None:
     now = datetime(2026, 8, 9, 1, 1, tzinfo=UTC)
 
-    assert healing_days(now, 30) == (EPOCH_DAY, date(2026, 8, 8), date(2026, 8, 9))
+    days = healing_days(now, 30)
+    assert days[0] == date(2026, 7, 11)
+    assert days[-1] == date(2026, 8, 9)
+    assert len(days) == 30
+    assert healing_days(now, 30, source_epoch=date(2026, 8, 7)) == (
+        date(2026, 8, 7),
+        date(2026, 8, 8),
+        date(2026, 8, 9),
+    )
     hour = datetime(2026, 8, 9, tzinfo=UTC)
     assert not is_hour_settled(hour, datetime(2026, 8, 9, 1, 0, 59, tzinfo=UTC))
     assert is_hour_settled(hour, datetime(2026, 8, 9, 1, 1, tzinfo=UTC))

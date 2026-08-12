@@ -17,6 +17,25 @@ def sealed_store(root: Path, days: int, *, start: date = date(2026, 8, 7)) -> Fa
     return store
 
 
+def sealed_store_with_rows(
+    root: Path,
+    rows: dict[str, list[dict[str, object]]],
+    *,
+    start: date = date(2026, 8, 7),
+) -> FactStore:
+    store = FactStore(root)
+    for offset in range(7):
+        source_day = start + timedelta(days=offset)
+        for hour_number in range(24):
+            source_hour = datetime.combine(source_day, datetime.min.time(), UTC) + timedelta(
+                hours=hour_number
+            )
+            values = rows if offset == 0 and hour_number == 0 else {}
+            store.commit_hour(_projection(source_hour, values))
+        store.seal_day(source_day)
+    return store
+
+
 def commit_sealed_day(store: FactStore, source_day: date, *, day_offset: int = 0) -> None:
     for hour_number in range(24):
         source_hour = datetime.combine(source_day, datetime.min.time(), UTC) + timedelta(
@@ -65,6 +84,7 @@ def _populated_rows(source_hour: datetime, day_offset: int) -> dict[str, list[di
         "final_rating": 1300 if is_ten_win else 1200,
         "final_rating_delta": 25 if is_ten_win else -10,
         "final_battle_id": final_battle_id,
+        "final_player_item_signature": hashlib.sha256(day.encode()).hexdigest(),
         "projection_code_version": "fixture-v1",
     }
     battles: list[dict[str, object]] = []
@@ -102,7 +122,7 @@ def _populated_rows(source_hour: datetime, day_offset: int) -> dict[str, list[di
             "run_id": run_id,
             "battle_id": final_battle_id,
             "card_set_label": "player_hand",
-            "card_set_status": "present",
+            "card_set_status": "Captured",
             "owner_side": "player",
             "card_kind": "item",
             "slot_index": index,

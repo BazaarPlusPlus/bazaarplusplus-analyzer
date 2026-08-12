@@ -221,3 +221,31 @@ def test_client_timestamp_anomalies_are_quality_rows_and_never_repartition_a_bun
         table = projected.tables[table_name]
         assert set(table.column("source_hour").to_pylist()) == {"2026-08-10T12"}
         assert set(table.column("source_day").to_pylist()) == {"2026-08-10"}
+
+
+@pytest.mark.parametrize(
+    ("hero", "final_rank", "unknown_hero", "unknown_final_rank"),
+    (
+        ("UnknownHero", "Legendary", True, False),
+        ("Vanessa", None, False, True),
+        ("Vanessa", "Mythic", False, True),
+        ("UnknownHero", "Mythic", True, True),
+    ),
+)
+def test_unaccepted_run_is_discarded_with_all_battles_and_cards(
+    hero: str,
+    final_rank: str | None,
+    unknown_hero: bool,
+    unknown_final_rank: bool,
+) -> None:
+    projected = _project_payload(payload(hero=hero, final_rank=final_rank))
+
+    assert projected.tables["runs"].num_rows == 0
+    assert projected.tables["battles"].num_rows == 0
+    assert projected.tables["battle_cards"].num_rows == 0
+    discarded = projected.tables["quarantine"].to_pylist()
+    assert len(discarded) == 1
+    assert discarded[0]["stage"] == "fact_filter"
+    assert discarded[0]["raw_run"] is True
+    assert discarded[0]["discarded_unknown_hero"] is unknown_hero
+    assert discarded[0]["discarded_unknown_final_rank"] is unknown_final_rank

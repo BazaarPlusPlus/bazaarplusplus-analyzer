@@ -14,7 +14,7 @@ import pyarrow as pa
 
 from bppanalyzer.bundle_source import Bundle, BundleSourceError, RawHourIndex, open_bundle
 
-PROJECTION_VERSION = "v5-phase1-2"
+PROJECTION_VERSION = "v5-consumer-contract-1"
 MAX_DECOMPRESSED_RUN_BYTES = 64 * 1024 * 1024
 ROW_BATCH_SIZE = 50_000
 
@@ -257,6 +257,9 @@ _SCHEMAS: dict[str, pa.Schema] = {
             ("run_id", pa.string()),
             ("stage", pa.string()),
             ("reason_code", pa.string()),
+            ("raw_run", pa.bool_()),
+            ("discarded_unknown_hero", pa.bool_()),
+            ("discarded_unknown_final_rank", pa.bool_()),
             ("first_seen_at", pa.string()),
             ("decoder_code_version", pa.string()),
             ("diagnostic_json", pa.string()),
@@ -385,6 +388,29 @@ def _project_bundle_rows(
                 "manifest_payload_battle_mismatch",
                 "A manifest Battle is absent from the payload",
             )
+        run = _slots(decoded[3], 22, "run")
+        hero = _hero(_text(run[0], "run.hero"))
+        final_rank = _normalized_rank(_nullable_text(run[12], "run.final_rank"))
+        unknown_hero = hero not in KNOWN_HEROES
+        unknown_final_rank = final_rank not in KNOWN_RANKS
+        if unknown_hero or unknown_final_rank:
+            yield (
+                "quarantine",
+                _quarantine_row(
+                    hour_key,
+                    day_key,
+                    downloaded.ref.bundle_id,
+                    run_id,
+                    "fact_filter",
+                    "unaccepted_run",
+                    first_seen,
+                    raw_run=True,
+                    discarded_unknown_hero=unknown_hero,
+                    discarded_unknown_final_rank=unknown_final_rank,
+                    detail={"hero": hero, "final_rank": final_rank},
+                ),
+            )
+            return
         projected = _prepare_valid_bundle(
             downloaded,
             manifest,
@@ -541,7 +567,7 @@ def _prepare_valid_bundle(
         "losses": _nullable_integer(run[9], "run.losses"),
         "initial_rank": _nullable_text(run[10], "run.initial_rank"),
         "initial_rating": _nullable_integer(run[11], "run.initial_rating"),
-        "final_rank": _nullable_text(run[12], "run.final_rank"),
+        "final_rank": _normalized_rank(_nullable_text(run[12], "run.final_rank")),
         "final_rating": _nullable_integer(run[13], "run.final_rating"),
         "final_rating_delta": _nullable_integer(run[14], "run.final_rating_delta"),
         "final_health": _nullable_integer(run[15], "run.final_health"),
@@ -817,6 +843,11 @@ def _quarantine_row(
     stage: str,
     reason: str,
     first_seen: str,
+    *,
+    raw_run: bool = False,
+    discarded_unknown_hero: bool = False,
+    discarded_unknown_final_rank: bool = False,
+    detail: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     return {
         "source_hour": hour,
@@ -825,9 +856,12 @@ def _quarantine_row(
         "run_id": run_id,
         "stage": stage,
         "reason_code": reason,
+        "raw_run": raw_run,
+        "discarded_unknown_hero": discarded_unknown_hero,
+        "discarded_unknown_final_rank": discarded_unknown_final_rank,
         "first_seen_at": first_seen,
         "decoder_code_version": PROJECTION_VERSION,
-        "diagnostic_json": _json({"reason": reason}),
+        "diagnostic_json": _json({"reason": reason, **(detail or {})}),
     }
 
 
@@ -977,6 +1011,10 @@ def _hero(value: str | None) -> str | None:
         return None
     normalized = value.strip()
     return HERO_ALIASES.get(normalized, normalized)
+
+
+def _normalized_rank(value: str | None) -> str | None:
+    return value.strip() if value is not None else None
 
 
 def _parse_time(value: object) -> datetime | None:
