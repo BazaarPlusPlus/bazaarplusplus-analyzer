@@ -139,7 +139,12 @@ class BundleSource:
         self._api_base_url = api_base_url.rstrip("/")
         self._sync_token = sync_token
         self._client = client or httpx.Client(
-            timeout=httpx.Timeout(30, connect=10), follow_redirects=False
+            timeout=httpx.Timeout(30, connect=10),
+            follow_redirects=False,
+            limits=httpx.Limits(
+                max_connections=download_concurrency + 4,
+                max_keepalive_connections=download_concurrency,
+            ),
         )
         self._owns_client = client is None
         self._clock = clock
