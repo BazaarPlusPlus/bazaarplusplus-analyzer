@@ -1,8 +1,8 @@
 # Analyzer operational measurements
 
-Measurements were taken on Apple Silicon against the production Bundle Server
-using read-only collection and local fact writes. No consumer object was
-published during measurement.
+These measurements were taken on Apple Silicon on 2026-08-11 and 2026-08-12
+against the production Bundle Server, using read-only collection and local fact
+writes. They are workload observations, not portable guarantees.
 
 ## Bundle retention behavior
 
@@ -22,14 +22,13 @@ pushback when the HTTP keepalive pool was sized to match.
 ## Local fact storage
 
 Busy hours produce roughly 17–22 MiB of Parquet, dominated by Battle Cards.
-Five sealed Source Days occupied about 1.9 GiB. Facts are intentionally retained
-as local recovery state; offsite backup policy remains an operator decision.
+Five sealed Source Days occupied about 1.9 GiB.
 
 ## Analysis resources
 
 Analysis of five Source Days containing 2.79 million Battles took about four
-seconds and stayed below 1 GiB RSS after build aggregation was bounded. The
-seven-day offline acceptance fixture remains below the 8 GiB build limit.
+seconds and stayed below 1 GiB RSS. The seven-day offline fixture remains below
+the 8 GiB build limit.
 
 Projection flushes fixed 50,000-row Arrow batches. A 2,500-Bundle synthetic
 hour with 1.13 million Battle Card rows peaked 159 MiB above its fresh-process
@@ -39,8 +38,4 @@ ingest limit.
 
 ## Consumer snapshot size
 
-The prior five-day measurement produced about 1 MiB across all legacy files.
-The current architecture removes manifest, quality, daily-object, and history
-overhead and publishes only the two latest snapshots, each spanning up to
-seven days. Exact sizes should be remeasured after the first coordinated
-production publication.
+The two current snapshot sizes have not yet been measured in production.

@@ -1,157 +1,61 @@
-# Analyzer Consumer Data Contract
+# Consumer data semantics
 
-## Purpose
-
-The analyzer publishes two current snapshots for two independent consumers:
-
-- the Web site reads up to seven days of additive hero metrics;
-- the Mod reads the current build recommendation corpus.
+The strict schemas in `../../contracts/v5/` own JSON field names, types,
+required fields, enums, and scalar bounds. This document owns population,
+calculation, ordering, and cross-field semantics. Domain terms are defined in
+`../../CONTEXT.md`.
 
 The public object set is exactly:
 
 ```text
-analyzer-v5/
-├── heroes/latest.json
-└── builds/latest.json
+analyzer-v5/heroes/latest.json
+analyzer-v5/builds/latest.json
 ```
 
-Both objects are mutable snapshots. A successful calculation overwrites the
-corresponding object at the same key. There are no public releases, manifests,
-daily partitions, quality files, or historical copies.
+Each key holds a mutable current snapshot for one independent consumer.
 
-Operational download and participation counts belong to the run report, not
-to either consumer payload.
+## Shared population and window
 
-## Shared source rules
+`Hero8` is normalized to `TheDragons`. A Run becomes an Accepted Run only when
+its normalized hero and final rank are canonical. The canonical ranks are
+`Bronze`, `Silver`, `Gold`, `Diamond`, `Master`, `Masters`, and `Legendary`.
+Rejecting a Run also rejects its Battles and card snapshots.
 
-### Accepted facts
+`Legendary` maps to the `legend` segment; every other canonical rank maps to
+`non_legend`. A Battle inherits the segment of its owning Run. The `all`
+segment is always derived by adding `legend` and `non_legend`.
 
-A Run enters the fact layer only when all of the following are true:
+Both products use the latest sequence of one to seven consecutive sealed
+Complete Source Days. A newer incomplete day does not block an earlier sealed
+day from ending the window. The window never crosses the optional Source
+Epoch. `window.start` and `window.end` are inclusive UTC dates, and
+`generated_at` is the UTC snapshot-generation time.
 
-- its hero is in the canonical hero catalog;
-- its final rank is present and in the canonical rank catalog.
+## Hero metrics
 
-The canonical rank catalog is `Bronze`, `Silver`, `Gold`, `Diamond`,
-`Master`, `Masters`, and `Legendary`. The `Legendary` source value maps to the
-`legend` consumer segment; every other canonical rank maps to `non_legend`.
+`heroes/latest.json` contains one newest-first partition per Source Day. Each
+partition has one row for every canonical Hero × stored Segment pair in
+canonical hero order, with `legend` before `non_legend`. An unobserved pair has
+zero counts and an empty `matchups` array.
 
-If either condition fails, the Run and all of its associated Battles and card
-snapshots are discarded before facts are written. Therefore the analyzed
-population has no unknown-rank segment and always satisfies:
+Only additive integer components are stored. A consumer selects up to the
+newest 1, 3, or 7 available partitions, sums each field by hero and segment,
+then derives rates and averages.
 
-```text
-all = legend + non_legend
-```
+### Run outcomes
 
-`legend` means final rank Legend. `non_legend` means any other recognized
-final rank. The segment of every Battle and Matchup is inherited from its
-owning Run.
+`runs.completed` counts completed Accepted Runs. `runs.scored` is the subset
+whose victories are from 0 through 10 and whose losses are non-negative.
 
-### Complete days and windows
-
-A Complete Source Day has 24 accepted Source Hours, from `00` through `23`
-UTC. Both products use the sequence ending at the latest sealed Complete
-Source Day and extending backward through consecutive Complete Source Days,
-with a minimum of one day and a maximum of seven days.
-
-If a newer Source Day has a missing hour, an unresolved download failure, or
-a failed fact validation, that day is not complete and is not included. The
-latest earlier sealed day can still end the Analysis Window. The analyzer
-publishes when at least one Complete Source Day is available, but it never
-publishes a partial day.
-
-`BPP_SOURCE_EPOCH` is an optional inclusive UTC date. Source Days before it
-are never downloaded, healed, sealed, or included in the Analysis Window. An
-Analysis Window cannot extend across the epoch boundary.
-
-`window.start` and `window.end` are inclusive UTC dates. `generated_at` is an
-ISO-8601 UTC timestamp describing when the snapshot was produced.
-
-## `heroes/latest.json`
-
-### Role
-
-This object contains one to seven daily partitions inside one response. The
-Web site folds the available daily integer counts to produce its 1-day, 3-day,
-and 7-day views. Rates and averages are never stored because they cannot be
-merged safely.
-
-Only `legend` and `non_legend` rows are stored. The Web site's `all` view is a
-field-wise sum of those two rows. Every day contains one row for every
-canonical hero and stored segment; a hero with no observations has zero
-counts and an empty `matchups` array.
-
-`days` is ordered newest first. Within each day, rows use canonical hero order
-(`Dooley`, `Jules`, `Karnok`, `Mak`, `Pygmalien`, `Stelle`, `TheDragons`,
-`Vanessa`), with `legend` before `non_legend` for each hero.
-
-### Shape
-
-```json
-{
-  "schema_version": 1,
-  "kind": "hero_metrics",
-  "generated_at": "2026-08-12T02:00:00Z",
-  "window": {
-    "start": "2026-08-05",
-    "end": "2026-08-11",
-    "days": 7
-  },
-  "days": [
-    {
-      "day": "2026-08-11",
-      "rows": [
-        {
-          "hero": "Vanessa",
-          "segment": "legend",
-          "runs": {
-            "completed": 16536,
-            "scored": 16536,
-            "ten_win": 6569
-          },
-          "outcomes": {
-            "perfect": 579,
-            "gold": 5990,
-            "silver": 3505,
-            "bronze": 3654
-          },
-          "ten_win_days": {
-            "known_count": 6569,
-            "sum_days": 82768
-          },
-          "matchups": [
-            {
-              "opponent_hero": "Jules",
-              "decided": 2287,
-              "wins": 1418,
-              "losses": 869
-            }
-          ]
-        }
-      ]
-    }
-  ]
-}
-```
-
-### Run fields
-
-`runs.completed` counts completed Accepted Runs.
-
-`runs.scored` counts completed Accepted Runs whose outcome can be classified
-from victories and losses. The outcome buckets are:
-
-| Bucket | Definition |
+| Outcome | Definition |
 | --- | --- |
 | `perfect` | 10 victories and 0 losses |
 | `gold` | 10 victories and at least 1 loss |
 | `silver` | 7–9 victories |
 | `bronze` | 4–6 victories |
-| misfortune | 0–3 victories; derived, not stored |
+| misfortune | 0–3 victories; derived |
 
-`runs.ten_win` is `perfect + gold`.
-
-The stored outcome counts satisfy:
+The additive invariants are:
 
 ```text
 0 <= scored <= completed
@@ -159,30 +63,21 @@ ten_win = perfect + gold
 misfortune = scored - perfect - gold - silver - bronze
 ```
 
-`ten_win_days.known_count` counts Ten-Win Runs with a known final Run day.
-`ten_win_days.sum_days` is the sum of those final Run days. Both values are
-stored so an average remains correct after combining multiple Source Days.
+`ten_win_days.known_count` counts Ten-Win Runs with a known final Run day;
+`ten_win_days.sum_days` sums those days. Their ratio remains correct after
+partitions are combined, and `known_count <= ten_win`.
 
 ### Matchups
 
-`matchups` retains hero-versus-hero Battle outcomes. It includes only decided
-Battles whose opponent hero is canonical and whose `winner_side` is `player`
-or `opponent`.
-
-For every Matchup row:
+A Matchup includes a Battle only when the opponent hero is canonical and the
+winner resolves to `player` or `opponent`. For every emitted row:
 
 ```text
 decided = wins + losses
 matchup_win_rate = wins / decided
 ```
 
-The removed per-game-day Battle view has no field in this contract. In
-particular, `battle_days` must not be emitted.
-
-### Web calculations
-
-The Web site first selects the most recent 1, 3, or 7 entries in `days`, then
-sums fields by hero and requested segment.
+### Consumer calculations
 
 | Display value | Calculation |
 | --- | --- |
@@ -195,155 +90,63 @@ sums fields by hero and requested segment.
 | Gold rate | `gold / scored` |
 | Silver rate | `silver / scored` |
 | Bronze rate | `bronze / scored` |
-| Misfortune rate | derived `misfortune / scored` |
+| Misfortune rate | `misfortune / scored` |
 | Matchup win rate | `wins / decided` |
 | Seven-day trend | daily `ten_win / completed` |
 
-A division with a zero denominator produces `null`, not zero.
+A zero denominator produces `null`.
 
-## `builds/latest.json`
+## Build corpus
 
-### Role
+`builds/latest.json` is calculated from all Accepted Runs in the Analysis
+Window without rank segmentation. Its positional rows are self-described by
+the payload's `schemas` object. Build IDs are zero-based positions in each
+hero's `builds` array.
 
-This object is the Mod's latest build recall and recommendation corpus. It is
-calculated over all Accepted Runs in the Analysis Window; it is not split by
-rank segment.
+The global card and enchantment tables are uniquely and deterministically
+sorted. Enchantment reference 0 means no enchantment. For each hero,
+`card_index` maps every card reference to exactly the emitted Build IDs whose
+identities contain that card.
 
-The wire format remains schema-driven and compact. Build IDs are implicit
-zero-based indices into each hero's `builds` array. `card_index` maps a card
-reference to the Build IDs containing that card.
+### Eligible final layouts
 
-### Shape
+A completed Accepted Run contributes a layout when:
 
-```json
-{
-  "schema_version": 2,
-  "kind": "ten_win_builds",
-  "generated_at": "2026-08-12T02:00:00Z",
-  "window": {
-    "start": "2026-08-05",
-    "end": "2026-08-11",
-    "days": 7
-  },
-  "cards": [
-    "11111111-1111-1111-1111-111111111111",
-    "22222222-2222-2222-2222-222222222222",
-    "33333333-3333-3333-3333-333333333333",
-    "44444444-4444-4444-4444-444444444444",
-    "55555555-5555-5555-5555-555555555555"
-  ],
-  "enchantments": [
-    null,
-    "Burn",
-    "Shielded"
-  ],
-  "schemas": {
-    "build": [
-      "card_refs",
-      "layout",
-      "stats"
-    ],
-    "layout": [
-      "card_ref",
-      "slot",
-      "tier",
-      "enchant_ref",
-      "size"
-    ],
-    "stats": [
-      "completed_run_count",
-      "ten_win_run_count",
-      "ten_win_rate_bps",
-      "p75_ten_win_final_day",
-      "score"
-    ]
-  },
-  "heroes": {
-    "Vanessa": {
-      "builds": [
-        [
-          [0, 1, 2, 3, 4],
-          [
-            [0, 0, 4, 0, 2],
-            [1, 2, 3, 1, 2],
-            [2, 4, 4, 0, 2],
-            [3, 6, 3, 0, 2],
-            [4, 8, 4, 2, 2]
-          ],
-          [123, 45, 3659, 13, 421037]
-        ]
-      ],
-      "card_index": [
-        [0, [0]],
-        [1, [0]],
-        [2, [0]],
-        [3, [0]],
-        [4, [0]]
-      ]
-    }
-  }
-}
-```
+- exactly one Battle is marked final and its ID equals the Run's
+  `final_battle_id`;
+- the final player-hand item snapshot is present and captured;
+- every item has a valid card template ID, positive size, and in-range slot;
+- the items occupy all 10 board slots exactly once.
 
-`enchantments[0]` is always `null`, so layout rows use enchantment reference
-zero for no enchantment. Card and enchantment tables are sorted
-deterministically. `heroes` contains every canonical hero; a hero with no
-selected Build has empty `builds` and `card_index` arrays.
+Socket-effect overlays (`card_type = 7`) share a socket with an item. They are
+removed before identity and occupancy are evaluated.
 
-The positional rows in the example decode as:
+A Build Identity is its hero plus the sorted multiset of card template IDs.
+Position, tier, and enchantment belong to layouts, not identity. Every eligible
+run with that identity contributes to `completed_run_count`; every such Run
+with 10 victories and non-negative losses contributes to
+`ten_win_run_count`. An identity becomes a candidate after at least one
+Ten-Win Run.
 
-```text
-build = [card_refs, layout, stats]
-layout item = [card_ref, slot, tier, enchant_ref, size]
-stats = [completed_run_count, ten_win_run_count,
-         ten_win_rate_bps, p75_ten_win_final_day, score]
-```
+The Representative Layout is the most frequent exact layout among the
+candidate's Ten-Win Runs. Frequency ties use canonical layout order: slot,
+card template ID, tier, enchantment, and size, followed by lexical canonical
+JSON order.
 
-`ten_win_rate_bps` is rounded to the nearest basis point, so `3659` means
-`36.59%`.
-
-### Eligible builds
-
-A completed Accepted Run contributes a final layout only when:
-
-- it has exactly one final Battle;
-- the Run's `final_battle_id` identifies that Battle;
-- the player-hand item snapshot is present;
-- every card has a positive size and a valid template identifier;
-- the final board occupies exactly 10 slots with no overlap and no gap.
-
-Socket-effect overlay entities (card type 7 — for example Jules's cooler and
-heater sockets and TheDragons's note sockets) share a socket with a real item.
-They are excluded from the layout, the Build Identity, and the occupancy
-check before the rules above are applied.
-
-The Build Identity is the hero plus the sorted multiset of final-board card
-template identifiers. Position, tier, and enchantment do not participate in
-identity. All eligible completed runs with the same identity contribute to
-`completed_run_count`; runs with ten victories contribute to
-`ten_win_run_count`.
-
-A Build Candidate must have at least one Ten-Win Run. Its Representative
-Layout is the most frequently observed exact layout among its Ten-Win Runs;
-ties use canonical layout ordering.
-
-Canonical layout ordering sorts layout items by slot, card template ID, tier,
-enchantment, and size, serializes that normalized layout as canonical JSON,
-and compares those JSON values lexicographically.
-
-`p75_ten_win_final_day` uses the nearest-rank method over known Ten-Win final
+`ten_win_rate_bps` is the observed Ten-Win rate rounded to the nearest whole
+basis point. `p75_ten_win_final_day` uses nearest rank over known Ten-Win final
 days:
 
 ```text
 sorted_days[ceil(0.75 * count) - 1]
 ```
 
-It is `null` only when no Ten-Win Run has a known final day.
+It is `null` when no Ten-Win Run has a known final day.
 
-### Build score and selection
+### Score and selection
 
-The score is the 95% Wilson lower bound of the observed Ten-Win rate, scaled
-to an integer:
+`score` is the 95% Wilson lower bound of the observed Ten-Win rate, scaled to
+an integer:
 
 ```text
 n = completed_run_count
@@ -353,101 +156,31 @@ z = 1.96
 
 lower = (p + z²/(2n) - z*sqrt(p*(1-p)/n + z²/(4n²)))
         / (1 + z²/n)
-
 score = round(lower * 1,000,000)
 ```
 
-This one score accounts for both observed rate and evidence volume. Rank,
-speed, losses, and card tier do not add separate score weights.
+For each hero, candidates are ordered by:
 
-For each hero:
+1. descending `score`;
+2. descending `ten_win_run_count`;
+3. ascending `p75_ten_win_final_day`, with `null` last;
+4. ascending Build Identity.
 
-1. sort candidates by descending `score`, descending `ten_win_run_count`,
-   ascending `p75_ten_win_final_day` with `null` last, then Build Identity;
-2. keep the first 500 candidates;
-3. for every candidate card not represented in those 500, append the
-   highest-ranked candidate containing that card.
+The core corpus is the first 500 candidates. For every candidate card absent
+from that core, append the highest-ranked candidate containing it. Appended
+candidates retain the same ranking order and may cover several absent cards.
 
-The third step preserves Mod recall for rare selected cards without changing
-the quality order of the core corpus.
+## Validation and publication
 
-## Publication
+Each product passes its JSON Schema and semantic validation before its local
+snapshot or public object is replaced. Product failures are isolated: a valid
+snapshot can advance while the other key remains unchanged.
 
-The two products are independent. Each is validated against its own schema
-and consumer parser before its R2 object is replaced. Failure to calculate or
-validate one product leaves that product's existing object unchanged and does
-not prevent a valid independent product from being replaced.
-
-Object replacement is atomic from the consumer's perspective. Both keys use:
+Public replacement uses canonical JSON and these headers:
 
 ```text
 Cache-Control: public,max-age=60,must-revalidate
 Content-Type: application/json
 ```
 
-Consumers use `window.end` as data freshness. They do not infer completeness
-from wall-clock time.
-
-## Run report
-
-Every invocation emits one structured report to local status and logs. This
-report is operational evidence and is not a public R2 object. When no sealed
-Complete Source Day exists at or after the configured Source Epoch, `window`
-is `null` and both `published` fields are false.
-
-```json
-{
-  "window": {
-    "start": "2026-08-05",
-    "end": "2026-08-11",
-    "days": 7
-  },
-  "downloads": {
-    "expected_bundles": 168000,
-    "succeeded_bundles": 167996,
-    "failed_bundles": 4
-  },
-  "facts": {
-    "raw_runs": 240000,
-    "discarded_unknown_hero": 27,
-    "discarded_unknown_final_rank": 7300,
-    "included_runs": 232673,
-    "included_battles": 2584031
-  },
-  "heroes": {
-    "participating_runs": 232673,
-    "participating_matchup_battles": 2584031,
-    "published": false
-  },
-  "builds": {
-    "eligible_layout_runs": 184321,
-    "candidate_builds": 12680,
-    "published_builds": 4127,
-    "published": false
-  }
-}
-```
-
-`failed_bundles > 0` prevents the affected Source Hour from completing. The
-report may therefore describe attempted work while both public objects remain
-unchanged. A successful report records zero failed Bundles and the actual
-participation counts used by each product.
-
-## Contract invariants
-
-Before publication, the analyzer verifies at least:
-
-- one to seven distinct consecutive days matching `window.days`, `start`, and
-  `end`;
-- exactly one row for each canonical hero and stored segment per day;
-- row segments are only `legend` or `non_legend`;
-- all counts are non-negative integers;
-- `ten_win = perfect + gold`;
-- outcome counts do not exceed `scored`, and `scored <= completed`;
-- `known_count <= ten_win`;
-- every Matchup satisfies `decided = wins + losses`;
-- no `battle_days` field exists;
-- every Build references valid card, enchantment, and Build indices;
-- every Build layout occupies exactly 10 slots;
-- emitted Builds and `card_index` agree in both directions;
-- the Mod's schema-2 parser accepts `builds/latest.json`.
+Consumers use `window.end` as data freshness.
