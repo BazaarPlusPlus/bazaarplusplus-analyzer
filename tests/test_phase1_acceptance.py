@@ -1,35 +1,33 @@
-from datetime import UTC, date, datetime, timedelta
 import hashlib
 import json
 import multiprocessing
 import os
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from bpp_analyzer.bundle_source import (
+from bppanalyzer.bundle_source import (
     Bundle,
     BundleRef,
     RawHourIndex,
     raw_commit_sha256,
 )
-from bpp_analyzer.driver import (
+from bppanalyzer.driver import (
     EPOCH_DAY,
     PipelineDriver,
     healing_days,
     is_hour_settled,
     peak_rss_bytes,
 )
-from bpp_analyzer.fact_store import FactStore
-from bpp_analyzer.projection import HourProjection, project_hour, table_schemas
+from bppanalyzer.fact_store import FactStore
+from bppanalyzer.projection import HourProjection, project_hour, table_schemas
 from tests.bundle_fixtures import bundle_bytes, payload
 
 
 class BusyHourSource:
-    def __init__(
-        self, *, bundle_count: int = 2_500, cards_per_set: int = 25
-    ) -> None:
+    def __init__(self, *, bundle_count: int = 2_500, cards_per_set: int = 25) -> None:
         self.bundle_count = bundle_count
         self.run_payload = payload(cards_per_set=cards_per_set)
 
@@ -63,14 +61,9 @@ def _measure_busy_hour(root: str, results) -> None:
     now = datetime(2026, 8, 7, 1, 1, tzinfo=UTC)
     source = BusyHourSource()
     baseline_rss = peak_rss_bytes()
-    summary = PipelineDriver(Path(root), source=source, clock=lambda: now).run(
-        heal_days=1
-    )
+    summary = PipelineDriver(Path(root), source=source, clock=lambda: now).run(heal_days=1)
     status = json.loads((Path(root) / "status.json").read_bytes())
-    cards_path = (
-        Path(root)
-        / "facts/hourly/source_hour=2026-08-07T00/battle_cards.parquet"
-    )
+    cards_path = Path(root) / "facts/hourly/source_hour=2026-08-07T00/battle_cards.parquet"
     metadata = pq.ParquetFile(cards_path).metadata
     results.put(
         {
@@ -87,10 +80,7 @@ def _empty_projection(hour: datetime) -> HourProjection:
     return HourProjection(
         hour,
         hashlib.sha256(hour.isoformat().encode()).hexdigest(),
-        {
-            name: pa.Table.from_pylist([], schema=schema)
-            for name, schema in table_schemas().items()
-        },
+        {name: pa.Table.from_pylist([], schema=schema) for name, schema in table_schemas().items()},
     )
 
 
@@ -115,10 +105,7 @@ def test_hour_ingest_records_and_stays_below_the_one_gib_peak_rss_limit(
     assert measured["card_row_groups"] > 1
     assert measured["peak_rss_bytes"] < 1024**3
     assert measured["status_peak_rss_bytes"] == measured["peak_rss_bytes"]
-    assert (
-        measured["peak_rss_bytes"] - measured["baseline_rss_bytes"]
-        < 256 * 1024**2
-    )
+    assert measured["peak_rss_bytes"] - measured["baseline_rss_bytes"] < 256 * 1024**2
 
 
 def test_batched_hour_commit_is_byte_deterministic_across_batch_boundaries(
@@ -133,14 +120,14 @@ def test_batched_hour_commit_is_byte_deterministic_across_batch_boundaries(
         index = source.hour_index(source_hour)
         FactStore(root).commit_hour(project_hour(index, source.stream(index)))
         hour_path = root / "facts/hourly/source_hour=2026-08-10T12"
-        committed.append(
-            {path.name: path.read_bytes() for path in sorted(hour_path.iterdir())}
-        )
+        committed.append({path.name: path.read_bytes() for path in sorted(hour_path.iterdir())})
 
-    assert pq.ParquetFile(
-        tmp_path
-        / "first/facts/hourly/source_hour=2026-08-10T12/battle_cards.parquet"
-    ).metadata.num_row_groups == 2
+    assert (
+        pq.ParquetFile(
+            tmp_path / "first/facts/hourly/source_hour=2026-08-10T12/battle_cards.parquet"
+        ).metadata.num_row_groups
+        == 2
+    )
     assert committed[0] == committed[1]
 
 
@@ -151,9 +138,7 @@ def test_one_source_day_persists_only_parquet_plus_at_most_one_percent_metadata(
     schema = table_schemas()
     day = date(2026, 8, 10)
     for hour_number in range(24):
-        hour = datetime.combine(day, datetime.min.time(), UTC) + timedelta(
-            hours=hour_number
-        )
+        hour = datetime.combine(day, datetime.min.time(), UTC) + timedelta(hours=hour_number)
         projection = _empty_projection(hour)
         if hour_number == 0:
             quarantine = pa.Table.from_pylist(

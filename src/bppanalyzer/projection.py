@@ -1,19 +1,18 @@
 """Streaming projection from verified Bundle V5 objects to five Arrow tables."""
 
+import gzip
+import hashlib
+import json
+import struct
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-import gzip
-import hashlib
 from io import BytesIO
-import json
-import struct
-from typing import Any
+from typing import Any, cast
 
 import pyarrow as pa
 
-from bpp_analyzer.bundle_source import Bundle, BundleSourceError, RawHourIndex, open_bundle
-
+from bppanalyzer.bundle_source import Bundle, BundleSourceError, RawHourIndex, open_bundle
 
 PROJECTION_VERSION = "v5-phase1-2"
 MAX_DECOMPRESSED_RUN_BYTES = 64 * 1024 * 1024
@@ -23,9 +22,7 @@ HERO_ALIASES = {"Hero8": "TheDragons"}
 KNOWN_HEROES = frozenset(
     {"Stelle", "Mak", "Jules", "Dooley", "Karnok", "Pygmalien", "Vanessa", "TheDragons"}
 )
-KNOWN_RANKS = frozenset(
-    {"Bronze", "Silver", "Gold", "Diamond", "Master", "Masters", "Legendary"}
-)
+KNOWN_RANKS = frozenset({"Bronze", "Silver", "Gold", "Diamond", "Master", "Masters", "Legendary"})
 
 
 class ProjectionError(RuntimeError):
@@ -74,16 +71,12 @@ class HourProjection:
     def tables(self) -> Mapping[str, pa.Table]:
         """Materialize Arrow tables for compatibility with small direct consumers."""
         if self._tables is None:
-            batches: dict[str, list[pa.RecordBatch]] = {
-                name: [] for name in _SCHEMAS
-            }
+            batches: dict[str, list[pa.RecordBatch]] = {name: [] for name in _SCHEMAS}
             for name, batch in self.iter_batches():
                 try:
                     batches[name].append(batch)
                 except KeyError as error:
-                    raise ProjectionError(
-                        f"Projection emitted an unknown table: {name}"
-                    ) from error
+                    raise ProjectionError(f"Projection emitted an unknown table: {name}") from error
             self._tables = {
                 name: pa.Table.from_batches(items, schema=_SCHEMAS[name])
                 for name, items in batches.items()
@@ -115,10 +108,7 @@ class HourProjection:
     def bundle_count(self) -> int:
         if self._tables is not None:
             return self._tables["runs"].num_rows + self._tables["quarantine"].num_rows
-        if (
-            self._batch_stream is not None
-            and self._batch_stream.bundle_count is not None
-        ):
+        if self._batch_stream is not None and self._batch_stream.bundle_count is not None:
             return self._batch_stream.bundle_count
         return self.tables["runs"].num_rows + self.tables["quarantine"].num_rows
 
@@ -126,20 +116,37 @@ class HourProjection:
 _SCHEMAS: dict[str, pa.Schema] = {
     "runs": pa.schema(
         [
-            ("source_hour", pa.string()), ("source_day", pa.string()),
-            ("available_at_ms", pa.int64()), ("bundle_id", pa.string()),
-            ("bundle_sha256", pa.string()), ("run_id", pa.string()),
-            ("player_account_id", pa.string()), ("client_created_at_ms", pa.int64()),
-            ("hero", pa.string()), ("game_mode", pa.string()), ("seed", pa.int64()),
-            ("started_at_utc", pa.string()), ("ended_at_utc", pa.string()),
-            ("status", pa.string()), ("run_day", pa.int64()), ("run_hour", pa.int64()),
-            ("victories", pa.int64()), ("losses", pa.int64()),
-            ("initial_rank", pa.string()), ("initial_rating", pa.int64()),
-            ("final_rank", pa.string()), ("final_rating", pa.int64()),
-            ("final_rating_delta", pa.int64()), ("final_health", pa.int64()),
-            ("prestige", pa.int64()), ("level", pa.int64()), ("income", pa.int64()),
-            ("gold", pa.int64()), ("build_channel", pa.string()),
-            ("mod_version", pa.string()), ("battle_count", pa.int64()),
+            ("source_hour", pa.string()),
+            ("source_day", pa.string()),
+            ("available_at_ms", pa.int64()),
+            ("bundle_id", pa.string()),
+            ("bundle_sha256", pa.string()),
+            ("run_id", pa.string()),
+            ("player_account_id", pa.string()),
+            ("client_created_at_ms", pa.int64()),
+            ("hero", pa.string()),
+            ("game_mode", pa.string()),
+            ("seed", pa.int64()),
+            ("started_at_utc", pa.string()),
+            ("ended_at_utc", pa.string()),
+            ("status", pa.string()),
+            ("run_day", pa.int64()),
+            ("run_hour", pa.int64()),
+            ("victories", pa.int64()),
+            ("losses", pa.int64()),
+            ("initial_rank", pa.string()),
+            ("initial_rating", pa.int64()),
+            ("final_rank", pa.string()),
+            ("final_rating", pa.int64()),
+            ("final_rating_delta", pa.int64()),
+            ("final_health", pa.int64()),
+            ("prestige", pa.int64()),
+            ("level", pa.int64()),
+            ("income", pa.int64()),
+            ("gold", pa.int64()),
+            ("build_channel", pa.string()),
+            ("mod_version", pa.string()),
+            ("battle_count", pa.int64()),
             ("replayable_battle_count", pa.int64()),
             ("battle_decided_count", pa.int64()),
             ("battle_player_win_count", pa.int64()),
@@ -156,60 +163,102 @@ _SCHEMAS: dict[str, pa.Schema] = {
     ),
     "battles": pa.schema(
         [
-            ("source_hour", pa.string()), ("source_day", pa.string()),
-            ("available_at_ms", pa.int64()), ("bundle_id", pa.string()),
-            ("run_id", pa.string()), ("battle_id", pa.string()),
-            ("recorded_at_utc", pa.string()), ("game_day", pa.int64()),
-            ("game_hour", pa.int64()), ("encounter_id", pa.string()),
-            ("combat_kind", pa.string()), ("result", pa.string()),
-            ("winner_combatant_id", pa.string()), ("loser_combatant_id", pa.string()),
-            ("is_final_battle", pa.bool_()), ("player_account_id", pa.string()),
-            ("player_display_name", pa.string()), ("player_hero", pa.string()),
-            ("player_rank", pa.string()), ("player_rating", pa.int64()),
-            ("player_level", pa.int64()), ("player_prestige", pa.int64()),
-            ("player_victories", pa.int64()), ("player_income", pa.int64()),
-            ("player_gold", pa.int64()), ("player_hand_item_count", pa.int64()),
-            ("player_skill_count", pa.int64()), ("opponent_account_id", pa.string()),
-            ("opponent_display_name", pa.string()), ("opponent_hero", pa.string()),
-            ("opponent_rank", pa.string()), ("opponent_rating", pa.int64()),
-            ("opponent_level", pa.int64()), ("opponent_prestige", pa.int64()),
-            ("opponent_victories", pa.int64()), ("opponent_income", pa.int64()),
-            ("opponent_gold", pa.int64()), ("opponent_hand_item_count", pa.int64()),
-            ("opponent_skill_count", pa.int64()), ("winner_side", pa.string()),
-            ("winner_hero", pa.string()), ("player_item_signature", pa.string()),
+            ("source_hour", pa.string()),
+            ("source_day", pa.string()),
+            ("available_at_ms", pa.int64()),
+            ("bundle_id", pa.string()),
+            ("run_id", pa.string()),
+            ("battle_id", pa.string()),
+            ("recorded_at_utc", pa.string()),
+            ("game_day", pa.int64()),
+            ("game_hour", pa.int64()),
+            ("encounter_id", pa.string()),
+            ("combat_kind", pa.string()),
+            ("result", pa.string()),
+            ("winner_combatant_id", pa.string()),
+            ("loser_combatant_id", pa.string()),
+            ("is_final_battle", pa.bool_()),
+            ("player_account_id", pa.string()),
+            ("player_display_name", pa.string()),
+            ("player_hero", pa.string()),
+            ("player_rank", pa.string()),
+            ("player_rating", pa.int64()),
+            ("player_level", pa.int64()),
+            ("player_prestige", pa.int64()),
+            ("player_victories", pa.int64()),
+            ("player_income", pa.int64()),
+            ("player_gold", pa.int64()),
+            ("player_hand_item_count", pa.int64()),
+            ("player_skill_count", pa.int64()),
+            ("opponent_account_id", pa.string()),
+            ("opponent_display_name", pa.string()),
+            ("opponent_hero", pa.string()),
+            ("opponent_rank", pa.string()),
+            ("opponent_rating", pa.int64()),
+            ("opponent_level", pa.int64()),
+            ("opponent_prestige", pa.int64()),
+            ("opponent_victories", pa.int64()),
+            ("opponent_income", pa.int64()),
+            ("opponent_gold", pa.int64()),
+            ("opponent_hand_item_count", pa.int64()),
+            ("opponent_skill_count", pa.int64()),
+            ("winner_side", pa.string()),
+            ("winner_hero", pa.string()),
+            ("player_item_signature", pa.string()),
             ("opponent_item_signature", pa.string()),
-            ("snapshot_available", pa.bool_()), ("replay_available", pa.bool_()),
+            ("snapshot_available", pa.bool_()),
+            ("replay_available", pa.bool_()),
         ]
     ),
     "battle_cards": pa.schema(
         [
-            ("source_hour", pa.string()), ("source_day", pa.string()),
-            ("available_at_ms", pa.int64()), ("bundle_id", pa.string()),
-            ("run_id", pa.string()), ("battle_id", pa.string()),
-            ("card_set_label", pa.string()), ("card_set_status", pa.string()),
-            ("card_set_source", pa.string()), ("owner_side", pa.string()),
-            ("card_kind", pa.string()), ("slot_index", pa.int64()),
-            ("instance_id", pa.string()), ("template_id", pa.string()),
-            ("card_type", pa.int64()), ("size", pa.int64()),
-            ("section", pa.int64()), ("socket", pa.int64()), ("name", pa.string()),
-            ("tier", pa.string()), ("enchantment", pa.string()),
-            ("tags_json", pa.string()), ("attributes_json", pa.string()),
+            ("source_hour", pa.string()),
+            ("source_day", pa.string()),
+            ("available_at_ms", pa.int64()),
+            ("bundle_id", pa.string()),
+            ("run_id", pa.string()),
+            ("battle_id", pa.string()),
+            ("card_set_label", pa.string()),
+            ("card_set_status", pa.string()),
+            ("card_set_source", pa.string()),
+            ("owner_side", pa.string()),
+            ("card_kind", pa.string()),
+            ("slot_index", pa.int64()),
+            ("instance_id", pa.string()),
+            ("template_id", pa.string()),
+            ("card_type", pa.int64()),
+            ("size", pa.int64()),
+            ("section", pa.int64()),
+            ("socket", pa.int64()),
+            ("name", pa.string()),
+            ("tier", pa.string()),
+            ("enchantment", pa.string()),
+            ("tags_json", pa.string()),
+            ("attributes_json", pa.string()),
         ]
     ),
     "quality": pa.schema(
         [
-            ("source_hour", pa.string()), ("source_day", pa.string()),
-            ("bundle_id", pa.string()), ("run_id", pa.string()),
-            ("code", pa.string()), ("severity", pa.string()),
-            ("blocks_release", pa.bool_()), ("detail_json", pa.string()),
+            ("source_hour", pa.string()),
+            ("source_day", pa.string()),
+            ("bundle_id", pa.string()),
+            ("run_id", pa.string()),
+            ("code", pa.string()),
+            ("severity", pa.string()),
+            ("blocks_release", pa.bool_()),
+            ("detail_json", pa.string()),
         ]
     ),
     "quarantine": pa.schema(
         [
-            ("source_hour", pa.string()), ("source_day", pa.string()),
-            ("bundle_id", pa.string()), ("run_id", pa.string()),
-            ("stage", pa.string()), ("reason_code", pa.string()),
-            ("first_seen_at", pa.string()), ("decoder_code_version", pa.string()),
+            ("source_hour", pa.string()),
+            ("source_day", pa.string()),
+            ("bundle_id", pa.string()),
+            ("run_id", pa.string()),
+            ("stage", pa.string()),
+            ("reason_code", pa.string()),
+            ("first_seen_at", pa.string()),
+            ("decoder_code_version", pa.string()),
             ("diagnostic_json", pa.string()),
         ]
     ),
@@ -238,28 +287,21 @@ class _ProjectedBatchStream:
         self.bundle_count: int | None = None
 
     def __iter__(self) -> Iterator[tuple[str, pa.RecordBatch]]:
-        buffers: dict[str, list[dict[str, object]]] = {
-            name: [] for name in _SCHEMAS
-        }
+        buffers: dict[str, list[dict[str, object]]] = {name: [] for name in _SCHEMAS}
         observed_count = 0
         projected_count = 0
         hour_key = self.index.source_hour.strftime("%Y-%m-%dT%H")
         day_key = self.index.source_hour.strftime("%Y-%m-%d")
         first_seen = (
-            (self.index.source_hour + timedelta(hours=1))
-            .isoformat()
-            .replace("+00:00", "Z")
+            (self.index.source_hour + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
         )
 
         for observed_count, downloaded in enumerate(self.bundles, start=1):
             if (
                 observed_count > len(self.index.items)
-                or downloaded.ref.bundle_id
-                != self.index.items[observed_count - 1].bundle_id
+                or downloaded.ref.bundle_id != self.index.items[observed_count - 1].bundle_id
             ):
-                raise ProjectionError(
-                    "Bundle stream did not match the complete ordered index"
-                )
+                raise ProjectionError("Bundle stream did not match the complete ordered index")
             rows = _project_bundle_rows(
                 downloaded,
                 hour_key=hour_key,
@@ -274,8 +316,9 @@ class _ProjectedBatchStream:
                 buffer.append(row)
                 if len(buffer) == ROW_BATCH_SIZE:
                     buffers[table_name] = []
-                    yield table_name, pa.RecordBatch.from_pylist(
-                        buffer, schema=_SCHEMAS[table_name]
+                    yield (
+                        table_name,
+                        pa.RecordBatch.from_pylist(buffer, schema=_SCHEMAS[table_name]),
                     )
             if bundle_accounted != 1:
                 raise ProjectionError("Bundle projection accounting is incomplete")
@@ -287,9 +330,7 @@ class _ProjectedBatchStream:
             raise ProjectionError("Bundle projection accounting is incomplete")
         for table_name, buffer in buffers.items():
             if buffer:
-                yield table_name, pa.RecordBatch.from_pylist(
-                    buffer, schema=_SCHEMAS[table_name]
-                )
+                yield table_name, pa.RecordBatch.from_pylist(buffer, schema=_SCHEMAS[table_name])
         self.bundle_count = projected_count
 
 
@@ -301,14 +342,17 @@ def _project_bundle_rows(
     first_seen: str,
 ) -> Iterator[tuple[str, dict[str, object]]]:
     if downloaded.validation_error is not None or downloaded.content is None:
-        yield "quarantine", _quarantine_row(
-            hour_key,
-            day_key,
-            downloaded.ref.bundle_id,
-            None,
-            "bundle_validation",
-            downloaded.validation_error or "bundle_missing",
-            first_seen,
+        yield (
+            "quarantine",
+            _quarantine_row(
+                hour_key,
+                day_key,
+                downloaded.ref.bundle_id,
+                None,
+                "bundle_validation",
+                downloaded.validation_error or "bundle_missing",
+                first_seen,
+            ),
         )
         return
     manifest: Mapping[str, Any] | None = None
@@ -319,9 +363,7 @@ def _project_bundle_rows(
         decoded = decode_run_payload(run_bytes)
         run_manifest = _object(manifest["run"], "run")
         run_id = _text(run_manifest.get("run_id"), "run.run_id")
-        account_id = _text(
-            run_manifest.get("player_account_id"), "run.player_account_id"
-        )
+        account_id = _text(run_manifest.get("player_account_id"), "run.player_account_id")
         if decoded[1] != run_id or decoded[2] != account_id:
             raise RunPayloadError(
                 "payload_identity_mismatch",
@@ -334,15 +376,10 @@ def _project_bundle_rows(
             for item in manifest_battles
         ]
         payload_battles = _array(decoded[5], "payload.battles")
-        payload_ids = [
-            _text(_slots(item, 5, "battle")[0], "battle_id")
-            for item in payload_battles
-        ]
+        payload_ids = [_text(_slots(item, 5, "battle")[0], "battle_id") for item in payload_battles]
         payload_id_set = set(payload_ids)
         if len(payload_ids) != len(payload_id_set):
-            raise RunPayloadError(
-                "duplicate_payload_battle_id", "Run payload repeats a Battle ID"
-            )
+            raise RunPayloadError("duplicate_payload_battle_id", "Run payload repeats a Battle ID")
         if any(item not in payload_id_set for item in manifest_ids):
             raise RunPayloadError(
                 "manifest_payload_battle_mismatch",
@@ -371,16 +408,19 @@ def _project_bundle_rows(
         try:
             if manifest is not None:
                 run_id = _object(manifest["run"], "run").get("run_id")
-        except (KeyError, TypeError, ValueError):
+        except KeyError, TypeError, ValueError:
             pass
-        yield "quarantine", _quarantine_row(
-            hour_key,
-            day_key,
-            downloaded.ref.bundle_id,
-            run_id if isinstance(run_id, str) else None,
-            "run_payload_decode",
-            reason,
-            first_seen,
+        yield (
+            "quarantine",
+            _quarantine_row(
+                hour_key,
+                day_key,
+                downloaded.ref.bundle_id,
+                run_id if isinstance(run_id, str) else None,
+                "run_payload_decode",
+                reason,
+                first_seen,
+            ),
         )
         return
     yield from projected.rows()
@@ -425,13 +465,8 @@ def _prepare_valid_bundle(
     run_id = _text(payload[1], "run_id")
     account_id = _text(payload[2], "player_account_id")
     run = _slots(payload[3], 22, "run")
-    battles = [
-        _slots(item, 5, "battle") for item in _array(payload[5], "battles")
-    ]
-    replayable_ids = [
-        _text(item, "replayable_id")
-        for item in _array(payload[6], "replayable_ids")
-    ]
+    battles = [_slots(item, 5, "battle") for item in _array(payload[5], "battles")]
+    replayable_ids = [_text(item, "replayable_id") for item in _array(payload[6], "replayable_ids")]
     degradation = _slots(payload[7], 4, "degradation")
     available_at_ms = downloaded.ref.available_at_ms
     base = {
@@ -472,9 +507,7 @@ def _prepare_valid_bundle(
         )
         recorded = _parse_time(battle_row["recorded_at_utc"])
         recorded_in_future |= recorded is not None and recorded > available
-        recorded_before_run |= (
-            recorded is not None and started is not None and recorded < started
-        )
+        recorded_before_run |= recorded is not None and started is not None and recorded < started
         for _card in _card_rows(base, battle):
             pass
     summary = _BattleSummary(
@@ -495,9 +528,7 @@ def _prepare_valid_bundle(
         **base,
         "bundle_sha256": downloaded.sha256,
         "player_account_id": account_id,
-        "client_created_at_ms": _integer(
-            manifest.get("created_at_ms"), "created_at_ms"
-        ),
+        "client_created_at_ms": _integer(manifest.get("created_at_ms"), "created_at_ms"),
         "hero": _hero(_text(run[0], "run.hero")),
         "game_mode": _text(run[1], "run.game_mode").strip(),
         "seed": _nullable_integer(run[2], "run.seed"),
@@ -556,14 +587,10 @@ def _battle_row(
     player_id = _nullable_text(player[0], "player.account_id")
     opponent_id = _nullable_text(opponent[0], "opponent.account_id")
     winner_id = _nullable_text(facts[6], "battle.winner_id")
-    if winner_id == "Player" or (
-        winner_id is not None and winner_id == player_id
-    ):
+    if winner_id == "Player" or (winner_id is not None and winner_id == player_id):
         winner_side = "player"
         winner_hero = _hero(_nullable_text(player[2], "player.hero"))
-    elif winner_id == "Opponent" or (
-        winner_id is not None and winner_id == opponent_id
-    ):
+    elif winner_id == "Opponent" or (winner_id is not None and winner_id == opponent_id):
         winner_side = "opponent"
         winner_hero = _hero(_nullable_text(opponent[2], "opponent.hero"))
     else:
@@ -604,18 +631,12 @@ def _participant(prefix: str, participant: tuple[Any, ...]) -> dict[str, object]
         f"{prefix}_victories": _nullable_integer(participant[7], f"{prefix}.victories"),
         f"{prefix}_income": _nullable_integer(participant[8], f"{prefix}.income"),
         f"{prefix}_gold": _nullable_integer(participant[9], f"{prefix}.gold"),
-        f"{prefix}_hand_item_count": _nullable_integer(
-            participant[10], f"{prefix}.hand_count"
-        ),
-        f"{prefix}_skill_count": _nullable_integer(
-            participant[11], f"{prefix}.skill_count"
-        ),
+        f"{prefix}_hand_item_count": _nullable_integer(participant[10], f"{prefix}.hand_count"),
+        f"{prefix}_skill_count": _nullable_integer(participant[11], f"{prefix}.skill_count"),
     }
 
 
-def _card_rows(
-    base: Mapping[str, object], battle: tuple[Any, ...]
-) -> Iterator[dict[str, object]]:
+def _card_rows(base: Mapping[str, object], battle: tuple[Any, ...]) -> Iterator[dict[str, object]]:
     if battle[3] is None:
         return
     snapshots = _slots(battle[3], 1, "battle.snapshots")
@@ -681,10 +702,7 @@ def _card_sets(battle: tuple[Any, ...] | None) -> dict[str, tuple[Any, ...]]:
 
 def _card_signature(battle: tuple[Any, ...] | None, label: str) -> str | None:
     card_set = _card_sets(battle).get(label)
-    if (
-        card_set is None
-        or (_nullable_text(card_set[1], "status") or "").lower() == "missing"
-    ):
+    if card_set is None or (_nullable_text(card_set[1], "status") or "").lower() == "missing":
         return None
     templates = [
         _text(_slots(card, 11, "card")[1], "card.template_id")
@@ -724,16 +742,18 @@ def _quality_rows(
         findings["run_battle_count_mismatch"] = {}
     wins = battle_summary.wins
     losses = battle_summary.losses
-    if run["victories"] is not None and run["losses"] is not None and (
-        run["victories"] != wins or run["losses"] != losses
+    if (
+        run["victories"] is not None
+        and run["losses"] is not None
+        and (run["victories"] != wins or run["losses"] != losses)
     ):
         findings["run_outcome_count_mismatch"] = {
-            "run_victories": run["victories"], "run_losses": run["losses"],
-            "battle_wins": wins, "battle_losses": losses,
+            "run_victories": run["victories"],
+            "run_losses": run["losses"],
+            "battle_wins": wins,
+            "battle_losses": losses,
         }
-    finals = [
-        battle for battle in battles if _slots(battle[1], 9, "facts")[8] is True
-    ]
+    finals = [battle for battle in battles if _slots(battle[1], 9, "facts")[8] is True]
     if not finals:
         findings["final_battle_missing"] = {}
     elif len(finals) > 1:
@@ -741,30 +761,30 @@ def _quality_rows(
     elif _card_signature(finals[0], "player_hand") is None:
         findings["final_player_hand_missing"] = {}
     heroes = {run["hero"]} | set(battle_summary.heroes)
-    unknown_heroes = sorted(
-        str(value) for value in heroes if value not in KNOWN_HEROES
-    )
+    unknown_heroes = sorted(str(value) for value in heroes if value not in KNOWN_HEROES)
     if unknown_heroes:
         findings["unknown_hero"] = {"values": unknown_heroes}
     ranks = {run["initial_rank"], run["final_rank"]} | set(battle_summary.ranks)
     unknown_ranks = sorted(
-        str(value)
-        for value in ranks
-        if value is not None and value not in KNOWN_RANKS
+        str(value) for value in ranks if value is not None and value not in KNOWN_RANKS
     )
     if unknown_ranks:
         findings["unknown_rank"] = {"values": unknown_ranks}
-    available = datetime.fromtimestamp(int(base["available_at_ms"]) / 1_000, tz=UTC)
+    available = datetime.fromtimestamp(
+        _integer(base["available_at_ms"], "available_at_ms") / 1_000,
+        tz=UTC,
+    )
     observed = [
-        datetime.fromtimestamp(int(run["client_created_at_ms"]) / 1_000, tz=UTC),
+        datetime.fromtimestamp(
+            _integer(run["client_created_at_ms"], "client_created_at_ms") / 1_000,
+            tz=UTC,
+        ),
         *filter(
             None,
             [_parse_time(run["started_at_utc"]), _parse_time(run["ended_at_utc"])],
         ),
     ]
-    if battle_summary.recorded_in_future or any(
-        value > available for value in observed
-    ):
+    if battle_summary.recorded_in_future or any(value > available for value in observed):
         findings["client_clock_future"] = {}
     if battle_summary.recorded_before_run:
         findings["client_clock_before_run"] = {}
@@ -818,9 +838,7 @@ def decode_run_payload(content: bytes) -> tuple[Any, ...]:
     try:
         with gzip.GzipFile(fileobj=BytesIO(content), mode="rb") as stream:
             while True:
-                chunk = stream.read(
-                    min(64 * 1024, MAX_DECOMPRESSED_RUN_BYTES - len(output) + 1)
-                )
+                chunk = stream.read(min(64 * 1024, MAX_DECOMPRESSED_RUN_BYTES - len(output) + 1))
                 if not chunk:
                     break
                 output.extend(chunk)
@@ -859,12 +877,12 @@ class _MessagePack:
         end = self._offset + count
         if end > len(self._content):
             raise ValueError("truncated MessagePack")
-        value = self._content[self._offset:end]
+        value = self._content[self._offset : end]
         self._offset = end
         return value
 
-    def _number(self, fmt: str) -> object:
-        return struct.unpack(fmt, self._take(struct.calcsize(fmt)))[0]
+    def _number(self, fmt: str) -> int | float:
+        return cast(int | float, struct.unpack(fmt, self._take(struct.calcsize(fmt)))[0])
 
     def _one(self) -> object:
         marker = self._take(1)[0]
@@ -888,13 +906,9 @@ class _MessagePack:
         if marker in {0xCA, 0xCB}:
             return self._number(">f" if marker == 0xCA else ">d")
         if marker in {0xCC, 0xCD, 0xCE, 0xCF}:
-            return self._number(
-                {0xCC: ">B", 0xCD: ">H", 0xCE: ">I", 0xCF: ">Q"}[marker]
-            )
+            return self._number({0xCC: ">B", 0xCD: ">H", 0xCE: ">I", 0xCF: ">Q"}[marker])
         if marker in {0xD0, 0xD1, 0xD2, 0xD3}:
-            return self._number(
-                {0xD0: ">b", 0xD1: ">h", 0xD2: ">i", 0xD3: ">q"}[marker]
-            )
+            return self._number({0xD0: ">b", 0xD1: ">h", 0xD2: ">i", 0xD3: ">q"}[marker])
         if marker in {0xD9, 0xDA, 0xDB}:
             size = int(self._number({0xD9: ">B", 0xDA: ">H", 0xDB: ">I"}[marker]))
             return self._take(size).decode("utf-8")
@@ -913,8 +927,7 @@ def _slots(value: object, count: int, field: str) -> tuple[Any, ...]:
     if isinstance(value, dict):
         try:
             return tuple(
-                value[index] if index in value else value[str(index)]
-                for index in range(count)
+                value[index] if index in value else value[str(index)] for index in range(count)
             )
         except KeyError as error:
             raise ValueError(f"{field} omits a numeric field") from error

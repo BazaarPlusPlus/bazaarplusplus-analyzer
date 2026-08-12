@@ -1,13 +1,13 @@
-from concurrent.futures import ThreadPoolExecutor
 import json
 import os
-from pathlib import Path
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
-from bpp_analyzer.locking import DirectoryLock, LockHeld, LockOwnershipLost
+from bppanalyzer.locking import DirectoryLock, LockHeld, LockOwnershipLost
 
 
 def test_live_lock_rejects_a_concurrent_holder_within_one_second_without_writes(
@@ -52,9 +52,7 @@ def test_stale_lock_race_has_exactly_one_winner(tmp_path: Path) -> None:
     barrier = threading.Barrier(2)
 
     def contend(run_id: str):
-        candidate = DirectoryLock(
-            tmp_path, run_id, heartbeat_interval=60, stale_after=300
-        )
+        candidate = DirectoryLock(tmp_path, run_id, heartbeat_interval=60, stale_after=300)
         barrier.wait()
         try:
             candidate.acquire()
@@ -78,9 +76,7 @@ def test_resumed_stale_holder_neither_writes_nor_removes_the_new_lock(
     heartbeat = tmp_path / ".lock/heartbeat"
     stale = time.time() - 600
     os.utime(heartbeat, (stale, stale))
-    current = DirectoryLock(
-        tmp_path, "current-run", heartbeat_interval=60, stale_after=300
-    )
+    current = DirectoryLock(tmp_path, "current-run", heartbeat_interval=60, stale_after=300)
     current.acquire()
 
     with pytest.raises(LockOwnershipLost):

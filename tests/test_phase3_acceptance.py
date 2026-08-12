@@ -1,16 +1,15 @@
-from datetime import UTC, date, datetime
 import json
 import os
+from datetime import UTC, date, datetime
 from pathlib import Path
 
-import bpp_analyzer.driver as driver_module
-import bpp_analyzer.release as release_module
-from bpp_analyzer.driver import PipelineDriver
-from bpp_analyzer.fact_store import FactStore
-from bpp_analyzer.object_store import LocalObjectStore, StoreRequest
-from bpp_analyzer.release import POINTER_KEY, ReleaseBuilder, ReleasePublisher
+import bppanalyzer.driver as driver_module
+import bppanalyzer.release as release_module
+from bppanalyzer.driver import PipelineDriver
+from bppanalyzer.fact_store import FactStore
+from bppanalyzer.object_store import LocalObjectStore, StoreRequest
+from bppanalyzer.release import POINTER_KEY, ReleaseBuilder, ReleasePublisher
 from tests.release_fixtures import commit_sealed_day, sealed_store
-
 
 NOW = datetime(2026, 8, 13, 23, 59, tzinfo=UTC)
 
@@ -63,9 +62,7 @@ def test_acceptance_1_and_8_second_run_is_a_cheap_nonmutating_noop(
     assert first_events[-3].startswith(
         "publish pointer check done: published_release_id=none elapsed="
     )
-    assert first_events[-2] == (
-        f"publish started: release_id={first.release_published}"
-    )
+    assert first_events[-2] == (f"publish started: release_id={first.release_published}")
     assert first_events[-1].startswith(
         f"publish done: release_id={first.release_published} uploaded="
     )
@@ -92,9 +89,7 @@ def test_acceptance_1_and_8_second_run_is_a_cheap_nonmutating_noop(
     assert second.exit_code == 0
     assert second.outcome == "noop"
     assert _snapshot(root / "facts", root / "releases") == before
-    assert [(item.operation, item.key) for item in objects.requests] == [
-        ("get", POINTER_KEY)
-    ]
+    assert [(item.operation, item.key) for item in objects.requests] == [("get", POINTER_KEY)]
     assert not any(event.startswith("healed ") for event in second_events)
     assert second_events[-1] == (
         f"publish skipped: release_id={first.release_published} already published"
@@ -126,14 +121,10 @@ def test_no_publish_builds_locally_and_performs_no_object_store_write(
     status = json.loads((root / "status.json").read_bytes())
     assert status["release"]["pointer_state"] == "absent"
     assert status["release"]["published_release_id"] is None
-    assert [(item.operation, item.key) for item in objects.requests] == [
-        ("get", POINTER_KEY)
-    ]
+    assert [(item.operation, item.key) for item in objects.requests] == [("get", POINTER_KEY)]
 
 
-def test_status_fallback_retains_authoritative_pointer_fields(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_status_fallback_retains_authoritative_pointer_fields(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "data"
     sealed_store(root, 1)
     current_time = [datetime(2026, 8, 7, 23, 59, tzinfo=UTC)]

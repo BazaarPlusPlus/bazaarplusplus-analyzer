@@ -1,18 +1,17 @@
-from datetime import UTC, datetime
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from bpp_analyzer.object_store import LocalObjectStore
-from bpp_analyzer.release import (
+from bppanalyzer.object_store import LocalObjectStore
+from bppanalyzer.release import (
     POINTER_KEY,
     PublishHold,
     ReleaseBuilder,
     ReleasePublisher,
 )
 from tests.release_fixtures import sealed_store
-
 
 NOW = datetime(2026, 8, 11, 15, tzinfo=UTC)
 

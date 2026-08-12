@@ -3,11 +3,10 @@ from pathlib import Path
 
 import pytest
 
-from bpp_analyzer.fact_store import FactStore
-from bpp_analyzer.object_store import LocalObjectStore
-from bpp_analyzer.release import POINTER_KEY, ReleaseBuilder, ReleasePublisher
+from bppanalyzer.fact_store import FactStore
+from bppanalyzer.object_store import LocalObjectStore
+from bppanalyzer.release import POINTER_KEY, ReleaseBuilder, ReleasePublisher
 from tests.release_fixtures import commit_sealed_day, sealed_store
-
 
 NOW = datetime(2026, 8, 11, 12, tzinfo=UTC)
 

@@ -3,19 +3,17 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-import bpp_analyzer.cli as cli
-from bpp_analyzer.config import Config
-from bpp_analyzer.locking import DirectoryLock
-from bpp_analyzer.object_store import LocalObjectStore
-from bpp_analyzer.release import POINTER_KEY, ReleaseBuilder
+import bppanalyzer.cli as cli
+from bppanalyzer.config import Config
+from bppanalyzer.locking import DirectoryLock
+from bppanalyzer.object_store import LocalObjectStore
+from bppanalyzer.release import POINTER_KEY, ReleaseBuilder
 from tests.release_fixtures import sealed_store
 
 
 def test_show_release_emits_the_local_manifest(tmp_path: Path, monkeypatch) -> None:
     store = sealed_store(tmp_path, 1)
-    release = ReleaseBuilder(tmp_path, store=store).build(
-        "2026-08-07", store.seals()
-    )
+    release = ReleaseBuilder(tmp_path, store=store).build("2026-08-07", store.seals())
     monkeypatch.setattr(
         cli,
         "load_config",
@@ -55,15 +53,16 @@ def test_publish_rollback_and_resume_commands_use_the_locked_publish_flow(
     assert blocked.exit_code == 3
     assert not (tmp_path / "publish-hold.json").exists()
 
-    assert runner.invoke(
-        cli.main,
-        ["rollback", older.release_id, "--reason", "fixture rollback"],
-    ).exit_code == 0
+    assert (
+        runner.invoke(
+            cli.main,
+            ["rollback", older.release_id, "--reason", "fixture rollback"],
+        ).exit_code
+        == 0
+    )
     assert runner.invoke(cli.main, ["publish", newer.release_id]).exit_code == 1
     assert json.loads(objects.get(POINTER_KEY).body)["release_id"] == older.release_id
 
-    assert runner.invoke(
-        cli.main, ["resume", "--reason", "fixture corrected"]
-    ).exit_code == 0
+    assert runner.invoke(cli.main, ["resume", "--reason", "fixture corrected"]).exit_code == 0
     assert runner.invoke(cli.main, ["publish", newer.release_id]).exit_code == 0
     assert json.loads(objects.get(POINTER_KEY).body)["release_id"] == newer.release_id

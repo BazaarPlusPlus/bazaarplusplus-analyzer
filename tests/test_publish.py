@@ -1,12 +1,12 @@
-from datetime import UTC, datetime
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from bpp_analyzer.fact_store import canonical_json
-from bpp_analyzer.object_store import LocalObjectStore
-from bpp_analyzer.release import (
+from bppanalyzer.fact_store import canonical_json
+from bppanalyzer.object_store import LocalObjectStore
+from bppanalyzer.release import (
     IMMUTABLE_CACHE_CONTROL,
     POINTER_CACHE_CONTROL,
     POINTER_KEY,
@@ -17,7 +17,6 @@ from bpp_analyzer.release import (
     ReleasePublisher,
 )
 from tests.release_fixtures import sealed_store
-
 
 NOW = datetime(2026, 8, 11, 12, tzinfo=UTC)
 
@@ -71,9 +70,7 @@ def test_check_12_unparseable_or_self_inconsistent_pointer_blocks_publish(
     with pytest.raises(InvalidPointer):
         ReleasePublisher(tmp_path / "data", objects, clock=lambda: NOW).publish(newer)
 
-    assert [(item.operation, item.key) for item in objects.requests] == [
-        ("get", POINTER_KEY)
-    ]
+    assert [(item.operation, item.key) for item in objects.requests] == [("get", POINTER_KEY)]
 
 
 def test_check_13_blocks_older_window_but_allows_corrected_same_anchor(
@@ -119,9 +116,7 @@ def test_checks_15_and_16_cache_headers_are_exact_and_pointer_put_is_last(
     _facts, _older, newer = _releases(tmp_path / "data")
     objects = LocalObjectStore(tmp_path / "objects", clock=lambda: NOW)
 
-    result = ReleasePublisher(
-        tmp_path / "data", objects, clock=lambda: NOW
-    ).publish(newer)
+    result = ReleasePublisher(tmp_path / "data", objects, clock=lambda: NOW).publish(newer)
 
     assert result.release_id == newer.release_id
     expected_keys = _release_keys(newer)

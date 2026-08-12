@@ -1,17 +1,17 @@
+import json
 from datetime import UTC, datetime
 from functools import partial
-import json
 from pathlib import Path
 
 from click.testing import CliRunner
 
-import bpp_analyzer.cli as cli
-from bpp_analyzer.bundle_source import RawHourIndex, RetryableSourceError, raw_commit_sha256
-from bpp_analyzer.config import Config
-from bpp_analyzer.driver import PipelineDriver
-from bpp_analyzer.locking import DirectoryLock
-from bpp_analyzer.object_store import LocalObjectStore
-from bpp_analyzer.release import (
+import bppanalyzer.cli as cli
+from bppanalyzer.bundle_source import RawHourIndex, RetryableSourceError, raw_commit_sha256
+from bppanalyzer.config import Config
+from bppanalyzer.driver import PipelineDriver
+from bppanalyzer.locking import DirectoryLock
+from bppanalyzer.object_store import LocalObjectStore
+from bppanalyzer.release import (
     POINTER_CACHE_CONTROL,
     POINTER_KEY,
     ReleaseBuilder,
@@ -89,9 +89,7 @@ def test_cli_maps_success_usage_lock_and_partial_outcomes_to_frozen_exit_codes(
     assert partial.exit_code == 4
 
 
-def test_cli_dry_run_uses_only_the_fake_pointer_get(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_cli_dry_run_uses_only_the_fake_pointer_get(tmp_path: Path, monkeypatch) -> None:
     data_root = tmp_path / "data"
     objects = LocalObjectStore(tmp_path / "fake-r2")
     monkeypatch.setattr(cli, "load_config", lambda **_kwargs: _config(data_root))
@@ -130,15 +128,9 @@ def test_cli_run_streams_the_heal_plan_and_zero_row_hour_progress(
     lines = result.output.splitlines()
     assert lines[0] == "heal plan: days=1 missing_settled_hours=1"
     assert lines[1] == "hour started: source_hour=2026-08-07T00 [1/1]"
-    assert lines[2].startswith(
-        "hour indexed: source_hour=2026-08-07T00 bundles=0 pages=1 elapsed="
-    )
-    assert lines[3] == (
-        "hour ingest started: source_hour=2026-08-07T00 bundles=0"
-    )
-    assert lines[4].startswith(
-        "healed 2026-08-07T00 bundles=0 rows=0 bytes="
-    )
+    assert lines[2].startswith("hour indexed: source_hour=2026-08-07T00 bundles=0 pages=1 elapsed=")
+    assert lines[3] == ("hour ingest started: source_hour=2026-08-07T00 bundles=0")
+    assert lines[4].startswith("healed 2026-08-07T00 bundles=0 rows=0 bytes=")
     assert lines[4].endswith("[1/1]")
     assert lines[-1] == "ok: 1 hours ingested, 0 days sealed, 0 days abandoned"
 
@@ -166,9 +158,7 @@ def test_cli_run_quiet_suppresses_progress_but_keeps_the_final_summary(
     )
 
     assert result.exit_code == 0
-    assert result.output.splitlines() == [
-        "ok: 1 hours ingested, 0 days sealed, 0 days abandoned"
-    ]
+    assert result.output.splitlines() == ["ok: 1 hours ingested, 0 days sealed, 0 days abandoned"]
 
 
 def test_cli_noop_prints_no_per_hour_progress_and_uses_one_pointer_get(
@@ -198,18 +188,14 @@ def test_cli_noop_prints_no_per_hour_progress_and_uses_one_pointer_get(
     )
 
     assert result.exit_code == 0
-    assert not any(
-        line.startswith("healed ") for line in result.output.splitlines()
-    )
+    assert not any(line.startswith("healed ") for line in result.output.splitlines())
     assert "already published" in result.output
     assert [(request.operation, request.key) for request in objects.requests] == [
         ("get", "analyzer-v5/manifest.json")
     ]
 
 
-def test_cli_run_records_an_invalid_pointer_as_error_exit_one(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_cli_run_records_an_invalid_pointer_as_error_exit_one(tmp_path: Path, monkeypatch) -> None:
     data_root = tmp_path / "data"
     now = datetime(2026, 8, 7, 23, 59, tzinfo=UTC)
     sealed_store(data_root, 1)
@@ -250,9 +236,7 @@ def test_cli_run_records_an_invalid_pointer_as_error_exit_one(
     ]
 
 
-def test_cli_run_quiet_still_prints_retryable_hour_errors(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_cli_run_quiet_still_prints_retryable_hour_errors(tmp_path: Path, monkeypatch) -> None:
     now = datetime(2026, 8, 7, 1, 1, tzinfo=UTC)
     monkeypatch.setattr(cli, "load_config", lambda **_kwargs: _config(tmp_path))
     monkeypatch.setattr(cli, "BundleSource", FailedContextSource)
@@ -279,9 +263,7 @@ def test_cli_run_quiet_still_prints_retryable_hour_errors(
     ]
 
 
-def test_cli_status_text_shows_live_current_run_progress(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_cli_status_text_shows_live_current_run_progress(tmp_path: Path, monkeypatch) -> None:
     status = {
         "facts": {"newest_sealed_day": None, "abandoned_days": []},
         "current_run": {

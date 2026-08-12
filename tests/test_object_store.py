@@ -1,8 +1,8 @@
-from datetime import UTC, datetime
 import hashlib
+from datetime import UTC, datetime
 from pathlib import Path
 
-from bpp_analyzer.object_store import LocalObjectStore
+from bppanalyzer.object_store import LocalObjectStore
 
 
 def test_local_object_store_exposes_stat_get_put_as_the_offline_system_boundary(
@@ -31,4 +31,3 @@ def test_local_object_store_exposes_stat_get_put_as_the_offline_system_boundary(
         ("put", "fixture/data.json"),
         ("get", "fixture/data.json"),
     ]
-

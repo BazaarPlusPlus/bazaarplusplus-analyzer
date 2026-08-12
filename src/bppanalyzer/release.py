@@ -1,25 +1,24 @@
 """Deterministic DuckDB analytics and atomic immutable local releases."""
 
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
 import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import re
 import shutil
 import tempfile
-from typing import Any
 import uuid
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
+from typing import Any
 
 import duckdb
 from jsonschema import Draft202012Validator
 
-from bpp_analyzer.fact_store import DaySeal, FactStore, TABLES, canonical_json, parse_source_day
-from bpp_analyzer.object_store import ObjectStat, ObjectStore, StoredObject
-
+from bppanalyzer.fact_store import TABLES, DaySeal, FactStore, canonical_json, parse_source_day
+from bppanalyzer.object_store import ObjectStat, ObjectStore, StoredObject
 
 EPOCH_DAY = date(2026, 8, 7)
 BUILDER_CODE_VERSION = "0.3.1"
@@ -77,9 +76,7 @@ _SCHEMA_FILES = {
     "quality": "quality.schema.json",
     "release_manifest": "release-manifest.schema.json",
 }
-_UUID_PATTERN = (
-    "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-)
+_UUID_PATTERN = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 
 
 class ReleaseBuildError(RuntimeError):
@@ -157,15 +154,11 @@ class OperatorResult:
 _CURRENT_UNSET = object()
 
 
-def window_seals(
-    seals: Iterable[DaySeal], anchor_day: date | str
-) -> tuple[DaySeal, ...]:
+def window_seals(seals: Iterable[DaySeal], anchor_day: date | str) -> tuple[DaySeal, ...]:
     """Select the maximal 1–7-day consecutive sealed window ending at anchor."""
     anchor = parse_source_day(anchor_day)
     if anchor < EPOCH_DAY:
-        raise ReleaseIdentityError(
-            f"Release anchor cannot precede epoch {EPOCH_DAY.isoformat()}"
-        )
+        raise ReleaseIdentityError(f"Release anchor cannot precede epoch {EPOCH_DAY.isoformat()}")
     by_day: dict[date, DaySeal] = {}
     for seal in seals:
         day = parse_source_day(seal.source_day)
@@ -198,9 +191,7 @@ def compute_release_id(
         "anchor_day": anchor.isoformat(),
         "day_seal_sha256s": [seal.day_seal_sha256 for seal in seals],
         "hourly_fact_commit_sha256s": [
-            hourly["fact_commit_sha256"]
-            for seal in seals
-            for hourly in seal.hourly_fact_commits
+            hourly["fact_commit_sha256"] for seal in seals for hourly in seal.hourly_fact_commits
         ],
         "builder_code_version": builder_code_version,
         "policy_version": policy_version,
@@ -254,12 +245,10 @@ def _candidate_score_sql() -> str:
         f"/ (1 + {z_squared!r} / completed))"
     )
     average_day = (
-        "CASE WHEN day_count=0 OR day_sum=0 THEN 10.0 "
-        "ELSE day_sum::DOUBLE / day_count END"
+        "CASE WHEN day_count=0 OR day_sum=0 THEN 10.0 ELSE day_sum::DOUBLE / day_count END"
     )
     average_losses = (
-        "CASE WHEN loss_count=0 OR loss_sum=0 THEN 0.0 "
-        "ELSE loss_sum::DOUBLE / loss_count END"
+        "CASE WHEN loss_count=0 OR loss_sum=0 THEN 0.0 ELSE loss_sum::DOUBLE / loss_count END"
     )
     return (
         "CAST(floor("
@@ -303,9 +292,7 @@ class ReleaseBuilder:
         self._ownership_check = ownership_check
         self._fault = fault_injector or (lambda _seam, _path: None)
 
-    def build(
-        self, anchor_day: date | str, seals: Iterable[DaySeal] | None = None
-    ) -> LocalRelease:
+    def build(self, anchor_day: date | str, seals: Iterable[DaySeal] | None = None) -> LocalRelease:
         anchor = parse_source_day(anchor_day)
         selected = window_seals(self.store.seals() if seals is None else seals, anchor)
         release_id = compute_release_id(
@@ -336,9 +323,7 @@ class ReleaseBuilder:
                 threads=self.threads,
             )
             analytics = _Analytics(connection, hour_paths, window, window_generated_at)
-            daily_bytes = {
-                day: analytics.hero_daily(day, _generated_at(day)) for day in days
-            }
+            daily_bytes = {day: analytics.hero_daily(day, _generated_at(day)) for day in days}
             heroes_bytes = analytics.hero_window()
             builds_bytes = analytics.builds()
         finally:
@@ -413,7 +398,9 @@ class ReleaseBuilder:
         try:
             manifest = _decode_object((path / "manifest.json").read_bytes(), "release_manifest")
         except OSError as error:
-            raise ReleaseBuildError(f"Existing release manifest is unreadable: {release_id}") from error
+            raise ReleaseBuildError(
+                f"Existing release manifest is unreadable: {release_id}"
+            ) from error
         if manifest.get("release_id") != release_id:
             raise ReleaseIdentityError(f"Existing release identity differs: {release_id}")
         return LocalRelease(release_id, path, manifest, reused=True)
@@ -631,9 +618,7 @@ def validate_release(path: str | Path, contracts_dir: str | Path | None = None) 
     _check_release_prefix(release_id, parse_source_day(manifest["window"]["end"]))
 
 
-def validate_local_releases(
-    data_root: str | Path, contracts_dir: str | Path | None = None
-) -> int:
+def validate_local_releases(data_root: str | Path, contracts_dir: str | Path | None = None) -> int:
     releases = Path(data_root) / "releases"
     if not releases.is_dir():
         return 0
@@ -789,9 +774,7 @@ class _Analytics:
             """,
             [source_day],
         ):
-            rank_values.setdefault((hero, segment), []).append(
-                {"rank": rank, "runs": int(runs)}
-            )
+            rank_values.setdefault((hero, segment), []).append({"rank": rank, "runs": int(runs)})
         opponent_values: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for hero, segment, rank, decided, wins, losses in self._rows(
             """
@@ -1000,9 +983,7 @@ class _Analytics:
             rating_sum = int(run[7])
             rating_sum_sq = int(run[8])
             mean = rating_sum / rating_runs if rating_runs else None
-            variance = (
-                rating_sum_sq / rating_runs - mean * mean if mean is not None else None
-            )
+            variance = rating_sum_sq / rating_runs - mean * mean if mean is not None else None
             rated, rated_wins, rated_losses, opponent_sum = map(int, battle)
             ten_runs = int(run[16])
             rows.append(
@@ -1041,7 +1022,9 @@ class _Analytics:
                     "rating_delta": {"runs": int(run[14]), "net": int(run[15])},
                     "ten_win": {
                         "runs": ten_runs,
-                        "avg_final_days": _one_decimal(int(run[17]) / ten_runs if ten_runs else None),
+                        "avg_final_days": _one_decimal(
+                            int(run[17]) / ten_runs if ten_runs else None
+                        ),
                     },
                     "rank_runs": ranks.get((hero, segment), []),
                     "opponent_ranks": opponent_ranks.get((hero, segment), []),
@@ -1321,7 +1304,9 @@ class _Analytics:
             selected = [(candidate, 0, None) for candidate in scored[:CORE_BUILD_LIMIT_PER_HERO]]
             selected_ids = {candidate["card_ids"] for candidate, _reason, _card in selected}
             pool_cards = cards_by_hero[hero]
-            covered = {card for candidate, _reason, _card in selected for card in candidate["card_ids"]}
+            covered = {
+                card for candidate, _reason, _card in selected for card in candidate["card_ids"]
+            }
             for card in sorted(pool_cards - covered):
                 if card in covered:
                     continue
@@ -1332,9 +1317,7 @@ class _Analytics:
                     covered.update(candidate["card_ids"])
             selected_by_hero[hero] = selected
 
-        card_table = sorted(
-            {card for values in cards_by_hero.values() for card in values}
-        )
+        card_table = sorted({card for values in cards_by_hero.values() for card in values})
         card_ref = {card: index for index, card in enumerate(card_table)}
         enchantment_names = sorted(
             {
@@ -1352,7 +1335,9 @@ class _Analytics:
             scored = scored_by_hero[hero]
             selected = selected_by_hero[hero]
             pool_cards = cards_by_hero[hero]
-            covered = {card for candidate, _reason, _card in selected for card in candidate["card_ids"]}
+            covered = {
+                card for candidate, _reason, _card in selected for card in candidate["card_ids"]
+            }
             build_rows = [
                 _build_row(candidate, reason, covered_card, card_ref, enchant_ref)
                 for candidate, reason, covered_card in selected
@@ -1369,7 +1354,9 @@ class _Analytics:
                     "included_build_count": len(selected),
                     "covered_card_count": len(covered & pool_cards),
                     "coverage": {
-                        "uncovered_card_refs": sorted(card_ref[card] for card in pool_cards - covered)
+                        "uncovered_card_refs": sorted(
+                            card_ref[card] for card in pool_cards - covered
+                        )
                     },
                     "builds": build_rows,
                     "card_index": [[ref, index[ref]] for ref in sorted(index)],
@@ -1443,8 +1430,11 @@ def _quality_payload(
     heroes: Mapping[str, Any],
     builds: Mapping[str, Any],
 ) -> bytes:
-    days = [
-        {"day": seal.source_day, "row_counts": {name: int(seal.row_counts[name]) for name in TABLES}}
+    days: list[dict[str, Any]] = [
+        {
+            "day": seal.source_day,
+            "row_counts": {name: int(seal.row_counts[name]) for name in TABLES},
+        }
         for seal in seals
     ]
     totals = {name: sum(item["row_counts"][name] for item in days) for name in TABLES}
@@ -1452,7 +1442,11 @@ def _quality_payload(
     checks = [
         {"id": "8", "passed": True, "detail": "window is consecutive, anchored, and epoch-clamped"},
         {"id": "9", "passed": True, "detail": "all five payload kinds validated before promotion"},
-        {"id": "10", "passed": True, "detail": "manifest inventory matches the exact staged file set"},
+        {
+            "id": "10",
+            "passed": True,
+            "detail": "manifest inventory matches the exact staged file set",
+        },
         {"id": "11", "passed": True, "detail": "release identity is prefixed by the anchor day"},
     ]
     return canonical_json(
@@ -1561,7 +1555,9 @@ def _validate_payload_value(value: Mapping[str, Any], contracts_dir: Path) -> No
     errors = sorted(validator.iter_errors(value), key=lambda item: list(item.absolute_path))
     if errors:
         location = "/".join(str(item) for item in errors[0].absolute_path) or "<root>"
-        raise ContractViolation(f"{kind} violates its frozen contract at {location}: {errors[0].message}")
+        raise ContractViolation(
+            f"{kind} violates its frozen contract at {location}: {errors[0].message}"
+        )
 
 
 def _parse_pointer(observed: StoredObject, contracts_dir: Path) -> PublishedPointer:
@@ -1573,7 +1569,9 @@ def _parse_pointer(observed: StoredObject, contracts_dir: Path) -> PublishedPoin
         window_end = window.get("end") if isinstance(window, dict) else None
         end = parse_source_day(window_end) if isinstance(window_end, str) else None
     except (ReleaseBuildError, TypeError, ValueError) as error:
-        raise InvalidPointer("Public pointer does not match the frozen manifest contract") from error
+        raise InvalidPointer(
+            "Public pointer does not match the frozen manifest contract"
+        ) from error
     if (
         end is None
         or not isinstance(release_id, str)
@@ -1748,9 +1746,7 @@ def _wilson_lower_bound(successes: int, total: int, z: float) -> float:
     proportion = successes / total
     denominator = 1 + z * z / total
     center = proportion + z * z / (2 * total)
-    margin = z * math.sqrt(
-        proportion * (1 - proportion) / total + z * z / (4 * total * total)
-    )
+    margin = z * math.sqrt(proportion * (1 - proportion) / total + z * z / (4 * total * total))
     return (center - margin) / denominator
 
 

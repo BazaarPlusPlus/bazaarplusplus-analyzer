@@ -1,9 +1,8 @@
-from datetime import UTC, datetime
 import gzip
 import hashlib
 import json
 import struct
-
+from datetime import UTC, datetime
 
 SOURCE_HOUR = datetime(2026, 8, 10, 12, tzinfo=UTC)
 
@@ -51,9 +50,7 @@ def _msgpack(value: object) -> bytes:
             if len(value) < 16
             else b"\xde" + struct.pack(">H", len(value))
         )
-        return prefix + b"".join(
-            _msgpack(key) + _msgpack(item) for key, item in value.items()
-        )
+        return prefix + b"".join(_msgpack(key) + _msgpack(item) for key, item in value.items())
     raise TypeError(type(value).__name__)
 
 
@@ -69,16 +66,21 @@ def payload(
     losses: int = 0,
     cards_per_set: int = 1,
 ) -> bytes:
-    player = [
-        account_id, "Alice", "Vanessa", "Legendary", 1100, 10, 2, 10, 8, 12, 1, 1
-    ]
-    opponent = [
-        "account-2", "Bob", "Pygmalien", "Gold", 1050, 10, 2, 8, 8, 12, 1, 1
-    ]
+    player = [account_id, "Alice", "Vanessa", "Legendary", 1100, 10, 2, 10, 8, 12, 1, 1]
+    opponent = ["account-2", "Bob", "Pygmalien", "Gold", 1050, 10, 2, 8, 8, 12, 1, 1]
     cards = [
         [
-            f"instance-{index + 1}", "item-one", 1, 2, 1, 3, "Item One", "Gold", None,
-            ["Weapon"], {"damage": 12},
+            f"instance-{index + 1}",
+            "item-one",
+            1,
+            2,
+            1,
+            3,
+            "Item One",
+            "Gold",
+            None,
+            ["Weapon"],
+            {"damage": 12},
         ]
         for index in range(cards_per_set)
     ]
@@ -96,12 +98,14 @@ def payload(
             True,
         ],
         [player, opponent],
-        [[
-            ["player_hand", "Complete", "capture", cards],
-            ["player_skills", "Complete", "capture", cards],
-            ["opponent_hand", "Complete", "capture", cards],
-            ["opponent_skills", "Complete", "capture", cards],
-        ]],
+        [
+            [
+                ["player_hand", "Complete", "capture", cards],
+                ["player_skills", "Complete", "capture", cards],
+                ["opponent_hand", "Complete", "capture", cards],
+                ["opponent_skills", "Complete", "capture", cards],
+            ]
+        ],
         [1, b"spawn", b"combat", b"despawn"],
     ]
     root = [
@@ -109,9 +113,28 @@ def payload(
         run_id,
         account_id,
         [
-            "Vanessa", "Ranked", 42, started_at, "2026-08-10T12:30:00Z",
-            "completed", 10, 2, victories, losses, "Gold", 1000, "Legendary", 1100,
-            100, 50, 2, 10, 8, 12, "stable", "5.1.0",
+            "Vanessa",
+            "Ranked",
+            42,
+            started_at,
+            "2026-08-10T12:30:00Z",
+            "completed",
+            10,
+            2,
+            victories,
+            losses,
+            "Gold",
+            1000,
+            "Legendary",
+            1100,
+            100,
+            50,
+            2,
+            10,
+            8,
+            12,
+            "stable",
+            "5.1.0",
         ],
         [],
         [battle],

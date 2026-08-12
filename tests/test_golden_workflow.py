@@ -1,14 +1,13 @@
 import json
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
-from bpp_analyzer.goldens import validate_golden_release
-from bpp_analyzer.release import ManifestMismatch, RELEASE_ID_PATTERN, ReleaseBuilder
+from bppanalyzer.goldens import validate_golden_release
+from bppanalyzer.release import RELEASE_ID_PATTERN, ManifestMismatch, ReleaseBuilder
 from tests.release_fixtures import sealed_store
-
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 FREEZE_SCRIPT = REPOSITORY_ROOT / "scripts/freeze_v5_goldens.py"
@@ -44,9 +43,7 @@ def test_freeze_script_copies_an_exact_valid_release_and_refuses_overwrite(
 ) -> None:
     data_root = tmp_path / "data"
     store = sealed_store(data_root, 1)
-    release = ReleaseBuilder(data_root, store=store).build(
-        "2026-08-07", store.seals()
-    )
+    release = ReleaseBuilder(data_root, store=store).build("2026-08-07", store.seals())
     output_root = tmp_path / "golden"
 
     first = _freeze(release.path, output_root)
@@ -69,9 +66,7 @@ def test_golden_validator_rejects_manifest_digest_or_size_drift(
 ) -> None:
     data_root = tmp_path / "data"
     store = sealed_store(data_root, 1)
-    release = ReleaseBuilder(data_root, store=store).build(
-        "2026-08-07", store.seals()
-    )
+    release = ReleaseBuilder(data_root, store=store).build("2026-08-07", store.seals())
     output_root = tmp_path / "golden"
     result = _freeze(release.path, output_root)
     assert result.returncode == 0, result.stderr

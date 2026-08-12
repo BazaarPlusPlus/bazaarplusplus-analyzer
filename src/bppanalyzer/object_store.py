@@ -1,13 +1,13 @@
 """Minimal object-store boundary with offline-local and Cloudflare R2 adapters."""
 
-from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import UTC, datetime
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
 import tempfile
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 import boto3
@@ -260,8 +260,7 @@ def _atomic_write(path: Path, content: bytes) -> None:
 
 def _canonical_json(value: object) -> bytes:
     return (
-        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        + "\n"
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
     ).encode("utf-8")
 
 

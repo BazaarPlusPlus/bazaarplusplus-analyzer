@@ -1,13 +1,13 @@
-from datetime import UTC, date, datetime, timedelta
 import json
-from pathlib import Path
 import shutil
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 from jsonschema import Draft202012Validator
 
-from bpp_analyzer.driver import PipelineDriver
-from bpp_analyzer.fact_store import canonical_json
-from bpp_analyzer.release import ReleaseBuilder
+from bppanalyzer.driver import PipelineDriver
+from bppanalyzer.fact_store import canonical_json
+from bppanalyzer.release import ReleaseBuilder
 from tests.release_fixtures import sealed_store
 
 
@@ -29,9 +29,7 @@ def _release_bytes(path: Path) -> dict[str, bytes]:
 
 def test_every_payload_matches_the_frozen_schema_and_source_time(tmp_path: Path) -> None:
     store = sealed_store(tmp_path, 2)
-    release = ReleaseBuilder(tmp_path, store=store, threads=4).build(
-        "2026-08-08", store.seals()
-    )
+    release = ReleaseBuilder(tmp_path, store=store, threads=4).build("2026-08-08", store.seals())
     contracts = Path(__file__).resolve().parents[1] / "contracts/v5"
     schema_for_path = {
         "manifest.json": "release-manifest.schema.json",
@@ -88,9 +86,7 @@ def test_seven_day_parallel_build_is_byte_deterministic_and_records_bounded_rss(
     first = _release_bytes(release_path)
 
     shutil.rmtree(release_path)
-    rebuilt = ReleaseBuilder(tmp_path, store=store, threads=4).build(
-        "2026-08-13", store.seals()
-    )
+    rebuilt = ReleaseBuilder(tmp_path, store=store, threads=4).build("2026-08-13", store.seals())
     second = _release_bytes(rebuilt.path)
 
     assert first == second

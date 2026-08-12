@@ -5,16 +5,16 @@ import uuid
 
 import click
 
-from bpp_analyzer.bundle_source import BundleSource
-from bpp_analyzer.config import ConfigurationError, load_config
-from bpp_analyzer.driver import PipelineDriver, read_status
-from bpp_analyzer.fact_store import FactStore, FactStoreError, parse_source_day
-from bpp_analyzer.locking import DirectoryLock, LockHeld, LockOwnershipLost
-from bpp_analyzer.object_store import ObjectStoreError, R2ObjectStore
-from bpp_analyzer.release import (
+from bppanalyzer.bundle_source import BundleSource
+from bppanalyzer.config import ConfigurationError, load_config
+from bppanalyzer.driver import PipelineDriver, read_status
+from bppanalyzer.fact_store import FactStore, FactStoreError, parse_source_day
+from bppanalyzer.locking import DirectoryLock, LockHeld, LockOwnershipLost
+from bppanalyzer.object_store import ObjectStoreError, R2ObjectStore
+from bppanalyzer.release import (
     PublishError,
-    ReleaseBuildError,
     ReleaseBuilder,
+    ReleaseBuildError,
     ReleasePublisher,
     validate_local_releases,
 )
@@ -137,9 +137,7 @@ def status_command(json_output: bool) -> None:
             f"hours={current.get('hours_done', 0)}/{current.get('hours_planned', 0)}",
         ]
         if isinstance(bundles, dict):
-            fields.append(
-                f"bundles={bundles.get('done', 0)}/{bundles.get('total', 0)}"
-            )
+            fields.append(f"bundles={bundles.get('done', 0)}/{bundles.get('total', 0)}")
         fields.extend(
             [
                 f"updated={current.get('updated_at') or '-'}",
@@ -160,9 +158,7 @@ def verify_command(day: str | None, deep: bool) -> None:
             parse_source_day(day)
         config = load_config(require_source=False)
         report = FactStore(config.data_root).verify(day, deep=deep)
-        releases_verified = (
-            validate_local_releases(config.data_root) if deep else 0
-        )
+        releases_verified = validate_local_releases(config.data_root) if deep else 0
     except (ConfigurationError, ValueError) as error:
         raise click.UsageError(str(error)) from None
     except (FactStoreError, ReleaseBuildError) as error:

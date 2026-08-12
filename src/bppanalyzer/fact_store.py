@@ -1,26 +1,24 @@
 """Atomic, immutable storage for hourly Parquet facts and Source Day seals."""
 
+import hashlib
+import json
+import os
+import re
+import shutil
+import tempfile
+import uuid
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
-import hashlib
-import json
-import os
 from pathlib import Path
-import re
-import shutil
-import tempfile
-from typing import Any
-import uuid
 
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from bpp_analyzer.bundle_source import parse_source_hour
-from bpp_analyzer.projection import HourProjection, table_schemas
-
+from bppanalyzer.bundle_source import parse_source_hour
+from bppanalyzer.projection import HourProjection, table_schemas
 
 TABLES = ("runs", "battles", "battle_cards", "quality", "quarantine")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -121,9 +119,7 @@ class FactStore:
         for stale in self._hourly.glob(f".{final.name}.tmp-*"):
             if stale.is_dir():
                 shutil.rmtree(stale, ignore_errors=True)
-        stage = Path(
-            tempfile.mkdtemp(prefix=f".{final.name}.tmp-", dir=self._hourly)
-        )
+        stage = Path(tempfile.mkdtemp(prefix=f".{final.name}.tmp-", dir=self._hourly))
         try:
             file_hashes: dict[str, str] = {}
             file_bytes: dict[str, int] = {}
@@ -146,13 +142,9 @@ class FactStore:
                 for name, batch in projected.iter_batches():
                     self._ownership_check()
                     if name not in writers:
-                        raise FactCorrupt(
-                            f"Hourly projection emitted unknown table {name}"
-                        )
+                        raise FactCorrupt(f"Hourly projection emitted unknown table {name}")
                     if batch.schema != schemas[name]:
-                        raise FactCorrupt(
-                            f"Hourly {name} schema differs from the owned schema"
-                        )
+                        raise FactCorrupt(f"Hourly {name} schema differs from the owned schema")
                     self._require_partition_columns(batch, name, hour_key, day_key)
                     writers[name].write_batch(batch, row_group_size=batch.num_rows)
                     row_counts[name] += batch.num_rows
@@ -170,9 +162,7 @@ class FactStore:
                         f"Staged Parquet checksum differs before promotion: {filename}"
                     )
                 if (stage / filename).stat().st_size != file_bytes[filename]:
-                    raise FactCorrupt(
-                        f"Staged Parquet size differs before promotion: {filename}"
-                    )
+                    raise FactCorrupt(f"Staged Parquet size differs before promotion: {filename}")
 
             body = {
                 "schema_version": 1,
@@ -200,9 +190,7 @@ class FactStore:
                         f"Existing Hourly Fact Partition is incomplete: {hour_key}"
                     ) from error
                 if existing != commit_bytes:
-                    raise FactConflict(
-                        f"Hourly Fact Partition commit conflict: {hour_key}"
-                    )
+                    raise FactConflict(f"Hourly Fact Partition commit conflict: {hour_key}")
                 committed = self._read_hour(hour, deep=True)
                 return replace(committed, reused=True)
 
@@ -220,18 +208,12 @@ class FactStore:
             raise FactConflict(f"Abandoned Source Day cannot be sealed: {day_key}")
         commits = []
         for hour_number in range(24):
-            hour = datetime.combine(day, datetime.min.time(), UTC) + timedelta(
-                hours=hour_number
-            )
+            hour = datetime.combine(day, datetime.min.time(), UTC) + timedelta(hours=hour_number)
             commits.append(self._read_hour(hour, deep=False))
-        if [commit.source_hour[-2:] for commit in commits] != [
-            f"{hour:02d}" for hour in range(24)
-        ]:
+        if [commit.source_hour[-2:] for commit in commits] != [f"{hour:02d}" for hour in range(24)]:
             raise FactCorrupt(f"Source Day does not contain hours 00-23: {day_key}")
 
-        row_counts = {
-            name: sum(commit.row_counts[name] for commit in commits) for name in TABLES
-        }
+        row_counts = {name: sum(commit.row_counts[name] for commit in commits) for name in TABLES}
         body = {
             "schema_version": 1,
             "source_day": day_key,
@@ -277,12 +259,7 @@ class FactStore:
         if path.is_file():
             return replace(self._read_abandoned(path), reused=True)
         hours = tuple(
-            sorted(
-                {
-                    parse_source_hour(value).strftime("%Y-%m-%dT%H")
-                    for value in missing_hours
-                }
-            )
+            sorted({parse_source_hour(value).strftime("%Y-%m-%dT%H") for value in missing_hours})
         )
         if not hours or any(not value.startswith(f"{day_key}T") for value in hours):
             raise ValueError("Abandonment must name missing hours from its Source Day")
@@ -345,16 +322,12 @@ class FactStore:
         day = parse_source_day(source_day)
         missing: list[datetime] = []
         for hour_number in range(24):
-            hour = datetime.combine(day, datetime.min.time(), UTC) + timedelta(
-                hours=hour_number
-            )
+            hour = datetime.combine(day, datetime.min.time(), UTC) + timedelta(hours=hour_number)
             if not self.has_hour(hour):
                 missing.append(hour)
         return tuple(missing)
 
-    def hour_paths(
-        self, days: Iterable[date | str]
-    ) -> Mapping[str, tuple[Path, ...]]:
+    def hour_paths(self, days: Iterable[date | str]) -> Mapping[str, tuple[Path, ...]]:
         paths = {name: [] for name in TABLES}
         for raw_day in days:
             day = parse_source_day(raw_day)
@@ -365,9 +338,7 @@ class FactStore:
                     paths[name].append(hour_path / f"{name}.parquet")
         return {name: tuple(values) for name, values in paths.items()}
 
-    def verify(
-        self, source_day: date | str | None = None, *, deep: bool = False
-    ) -> VerifyReport:
+    def verify(self, source_day: date | str | None = None, *, deep: bool = False) -> VerifyReport:
         days = (
             (parse_source_day(source_day),)
             if source_day is not None
@@ -435,9 +406,7 @@ class FactStore:
             try:
                 actual_size = (path / filename).stat().st_size
             except OSError as error:
-                raise FactCorrupt(
-                    f"Hourly Parquet is missing: {hour_key}/{filename}"
-                ) from error
+                raise FactCorrupt(f"Hourly Parquet is missing: {hour_key}/{filename}") from error
             if actual_size != file_bytes[filename]:
                 raise FactCorrupt(f"Hourly Parquet size differs: {hour_key}/{filename}")
             if deep and _sha256_file(path / filename) != file_hashes[filename]:
@@ -449,11 +418,7 @@ class FactStore:
             raise FactCorrupt(f"Hourly raw identity is invalid: {hour_key}")
         if not isinstance(version, str) or not version:
             raise FactCorrupt(f"Hourly projection version is invalid: {hour_key}")
-        if (
-            not isinstance(bundle_count, int)
-            or isinstance(bundle_count, bool)
-            or bundle_count < 0
-        ):
+        if not isinstance(bundle_count, int) or isinstance(bundle_count, bool) or bundle_count < 0:
             raise FactCorrupt(f"Hourly Bundle count is invalid: {hour_key}")
         return HourCommit(
             source_hour=hour_key,
@@ -481,16 +446,17 @@ class FactStore:
         day = value.get("source_day")
         try:
             expected_path = self._seal_path(parse_source_day(day)) if isinstance(day, str) else None
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             expected_path = None
         if path != expected_path:
             raise FactCorrupt(f"Source Day Seal identity differs: {path.name}")
         hourly = value.get("hourly_fact_commits")
         expected_hours = [f"{day}T{number:02d}" for number in range(24)]
-        observed_hours = [
-            item.get("source_hour") if isinstance(item, dict) else None
-            for item in hourly
-        ] if isinstance(hourly, list) else None
+        observed_hours = (
+            [item.get("source_hour") if isinstance(item, dict) else None for item in hourly]
+            if isinstance(hourly, list)
+            else None
+        )
         if observed_hours != expected_hours:
             raise FactCorrupt(f"Source Day Seal must contain hours 00-23: {day}")
         for item in hourly:
@@ -525,8 +491,10 @@ class FactStore:
         reason = value.get("reason")
         abandoned_at = value.get("abandoned_at")
         try:
-            expected_path = self._abandon_path(parse_source_day(day)) if isinstance(day, str) else None
-        except (TypeError, ValueError):
+            expected_path = (
+                self._abandon_path(parse_source_day(day)) if isinstance(day, str) else None
+            )
+        except TypeError, ValueError:
             expected_path = None
         if (
             path != expected_path
@@ -549,14 +517,12 @@ class FactStore:
             return
         source_hour = batch.column("source_hour")
         if (
-            source_hour.null_count
-            or pc.all(pc.equal(source_hour, hour_key)).as_py() is not True
+            source_hour.null_count or pc.all(pc.equal(source_hour, hour_key)).as_py() is not True  # ty: ignore[unresolved-attribute]
         ):
             raise FactCorrupt(f"{table_name} rows moved outside their Source Hour")
         source_day = batch.column("source_day")
         if (
-            source_day.null_count
-            or pc.all(pc.equal(source_day, day_key)).as_py() is not True
+            source_day.null_count or pc.all(pc.equal(source_day, day_key)).as_py() is not True  # ty: ignore[unresolved-attribute]
         ):
             raise FactCorrupt(f"{table_name} rows moved outside their Source Day")
 
@@ -588,8 +554,7 @@ def parse_source_day(value: date | str) -> date:
 
 def canonical_json(value: object) -> bytes:
     return (
-        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        + "\n"
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
     ).encode("utf-8")
 
 
@@ -598,9 +563,7 @@ def _digest_map(value: object, expected: set[str], label: str) -> dict[str, str]
         not isinstance(value, dict)
         or set(value) != expected
         or not all(
-            isinstance(key, str)
-            and isinstance(item, str)
-            and _SHA256.fullmatch(item) is not None
+            isinstance(key, str) and isinstance(item, str) and _SHA256.fullmatch(item) is not None
             for key, item in value.items()
         )
     ):

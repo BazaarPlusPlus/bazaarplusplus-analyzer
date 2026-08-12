@@ -4,9 +4,8 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 
-from bpp_analyzer.fact_store import FactConflict, FactCorrupt, FactMissing, FactStore
-from bpp_analyzer.projection import HourProjection, table_schemas
-
+from bppanalyzer.fact_store import FactConflict, FactCorrupt, FactMissing, FactStore
+from bppanalyzer.projection import HourProjection, table_schemas
 
 HOUR = datetime(2026, 8, 10, 12, tzinfo=UTC)
 
@@ -63,18 +62,13 @@ def test_identical_recommit_is_reused_but_different_canonical_commit_is_a_hard_c
 def test_seal_requires_exactly_24_independently_verified_hours(tmp_path: Path) -> None:
     store = FactStore(tmp_path)
     for hour_number in range(23):
-        store.commit_hour(
-            _empty_hour(datetime(2026, 8, 10, hour_number, tzinfo=UTC))
-        )
+        store.commit_hour(_empty_hour(datetime(2026, 8, 10, hour_number, tzinfo=UTC)))
 
     with pytest.raises(FactMissing, match="2026-08-10T23"):
         store.seal_day("2026-08-10")
 
     store.commit_hour(_empty_hour(datetime(2026, 8, 10, 23, tzinfo=UTC)))
-    damaged = (
-        tmp_path
-        / "facts/hourly/source_hour=2026-08-10T07/quality.parquet"
-    )
+    damaged = tmp_path / "facts/hourly/source_hour=2026-08-10T07/quality.parquet"
     damaged.write_bytes(damaged.read_bytes()[:-1])
 
     with pytest.raises(FactCorrupt, match="size differs"):
@@ -86,9 +80,7 @@ def test_verify_rehashes_parquet_and_hour_paths_expose_only_a_sealed_window(
 ) -> None:
     store = FactStore(tmp_path)
     for hour_number in range(24):
-        store.commit_hour(
-            _empty_hour(datetime(2026, 8, 10, hour_number, tzinfo=UTC))
-        )
+        store.commit_hour(_empty_hour(datetime(2026, 8, 10, hour_number, tzinfo=UTC)))
     store.seal_day("2026-08-10")
 
     paths = store.hour_paths(["2026-08-10"])
