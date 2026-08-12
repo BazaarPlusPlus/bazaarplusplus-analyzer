@@ -69,6 +69,7 @@ def payload(
     loser_combatant_id: str | None = None,
     victories: int = 10,
     losses: int = 0,
+    cards_per_set: int = 1,
 ) -> bytes:
     player = [
         account_id, "Alice", "Vanessa", "Legendary", 1100, 10, 2, 10, 8, 12, 1, 1
@@ -76,9 +77,12 @@ def payload(
     opponent = [
         "account-2", "Bob", "Pygmalien", "Gold", 1050, 10, 2, 8, 8, 12, 1, 1
     ]
-    card = [
-        "instance-1", "item-one", 1, 2, 1, 3, "Item One", "Gold", None,
-        ["Weapon"], {"damage": 12},
+    cards = [
+        [
+            f"instance-{index + 1}", "item-one", 1, 2, 1, 3, "Item One", "Gold", None,
+            ["Weapon"], {"damage": 12},
+        ]
+        for index in range(cards_per_set)
     ]
     battle = [
         "battle-1",
@@ -95,10 +99,10 @@ def payload(
         ],
         [player, opponent],
         [[
-            ["player_hand", "Complete", "capture", [card]],
-            ["player_skills", "Complete", "capture", [card]],
-            ["opponent_hand", "Complete", "capture", [card]],
-            ["opponent_skills", "Complete", "capture", [card]],
+            ["player_hand", "Complete", "capture", cards],
+            ["player_skills", "Complete", "capture", cards],
+            ["opponent_hand", "Complete", "capture", cards],
+            ["opponent_skills", "Complete", "capture", cards],
         ]],
         [1, b"spawn", b"combat", b"despawn"],
     ]

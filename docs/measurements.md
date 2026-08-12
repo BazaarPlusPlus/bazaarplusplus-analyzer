@@ -62,14 +62,29 @@ Whole release (5-day window): **1.0 MiB** total; `window/heroes.json`
 `window/builds.json` (4,600 builds, 1,026-card index) are each a few hundred
 KiB. Size is a non-issue; no compact-encoding pressure on `heroes.json`.
 
-## Ingest peak RSS — measured; fix in progress
+## Ingest peak RSS — remediated; real-heal remeasurement pending
 
 Multi-hour heal runs peaked at ~5 GiB RSS with the original whole-hour
 Python-dict projection (busy hours materialize millions of battle_cards rows
 before a single Parquet write), violating acceptance #5's 1 GiB/hour bound on
-real data even though the synthetic-fixture test passed. Remediation:
-projection is being converted to stream bounded row batches through
-`pyarrow.parquet.ParquetWriter`.
+real data even though the original synthetic-fixture test passed. Projection
+now flushes each fact table at fixed 50,000-row boundaries and `fact_store`
+writes each batch through `pyarrow.parquet.ParquetWriter` before accepting the
+next batch.
+
+Offline measurements on 2026-08-12:
+
+- 2,500 Bundles / 250,000 `battle_cards` rows: the original path grew RSS by
+  438 MiB; the batched path grew it by 147 MiB and wrote five row groups.
+- 2,500 Bundles / 1.13 M `battle_cards` rows (the same row scale as the
+  largest committed real hour): the batched path peaked at 252 MiB total RSS,
+  159 MiB above its fresh-process baseline, and wrote 23 row groups.
+
+The projection component is therefore constant-space in hour row count. The
+expected end-to-end peak for a busy real hour is roughly 0.3–0.7 GiB after
+allowing for the configured 128-download look-ahead and one decoded Bundle;
+the next real heal should record the production number in `status.json` and
+replace this estimate.
 
 ## Still open
 

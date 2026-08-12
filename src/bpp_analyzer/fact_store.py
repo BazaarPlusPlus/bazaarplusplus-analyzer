@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 import hashlib
@@ -15,6 +16,8 @@ import tempfile
 from typing import Any
 import uuid
 
+import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from bpp_analyzer.bundle_source import parse_source_hour
@@ -107,13 +110,13 @@ class FactStore:
         hour = parse_source_hour(projected.source_hour)
         hour_key = hour.strftime("%Y-%m-%dT%H")
         day_key = hour.strftime("%Y-%m-%d")
-        if set(projected.tables) != set(TABLES):
+        if set(projected.table_names) != set(TABLES):
             raise FactCorrupt("Hourly projection must contain exactly five tables")
         schemas = table_schemas()
+        projected_schemas = projected.schemas
         for name in TABLES:
-            if projected.tables[name].schema != schemas[name]:
+            if projected_schemas[name] != schemas[name]:
                 raise FactCorrupt(f"Hourly {name} schema differs from the owned schema")
-            self._require_partition_columns(projected, name, hour_key, day_key)
 
         self._hourly.mkdir(parents=True, exist_ok=True)
         final = self._hourly / f"source_hour={hour_key}"
@@ -126,23 +129,41 @@ class FactStore:
         try:
             file_hashes: dict[str, str] = {}
             file_bytes: dict[str, int] = {}
-            row_counts: dict[str, int] = {}
+            row_counts = {name: 0 for name in TABLES}
+            with ExitStack() as writer_stack:
+                writers = {
+                    name: writer_stack.enter_context(
+                        pq.ParquetWriter(
+                            stage / f"{name}.parquet",
+                            schemas[name],
+                            compression="zstd",
+                            version="2.6",
+                            data_page_version="2.0",
+                            use_dictionary=True,
+                            write_statistics=True,
+                        )
+                    )
+                    for name in TABLES
+                }
+                for name, batch in projected.iter_batches():
+                    self._ownership_check()
+                    if name not in writers:
+                        raise FactCorrupt(
+                            f"Hourly projection emitted unknown table {name}"
+                        )
+                    if batch.schema != schemas[name]:
+                        raise FactCorrupt(
+                            f"Hourly {name} schema differs from the owned schema"
+                        )
+                    self._require_partition_columns(batch, name, hour_key, day_key)
+                    writers[name].write_batch(batch, row_group_size=batch.num_rows)
+                    row_counts[name] += batch.num_rows
+
             for name in TABLES:
-                self._ownership_check()
                 path = stage / f"{name}.parquet"
-                pq.write_table(
-                    projected.tables[name],
-                    path,
-                    compression="zstd",
-                    version="2.6",
-                    data_page_version="2.0",
-                    use_dictionary=True,
-                    write_statistics=True,
-                )
                 _fsync_file(path)
                 file_hashes[path.name] = _sha256_file(path)
                 file_bytes[path.name] = path.stat().st_size
-                row_counts[name] = projected.tables[name].num_rows
 
             self._fault("before_precommit_verify", stage)
             for filename, expected in file_hashes.items():
@@ -524,14 +545,21 @@ class FactStore:
 
     @staticmethod
     def _require_partition_columns(
-        projected: HourProjection, table_name: str, hour_key: str, day_key: str
+        batch: pa.RecordBatch, table_name: str, hour_key: str, day_key: str
     ) -> None:
-        table = projected.tables[table_name]
-        if table.num_rows == 0:
+        if batch.num_rows == 0:
             return
-        if set(table.column("source_hour").to_pylist()) != {hour_key}:
+        source_hour = batch.column("source_hour")
+        if (
+            source_hour.null_count
+            or pc.all(pc.equal(source_hour, hour_key)).as_py() is not True
+        ):
             raise FactCorrupt(f"{table_name} rows moved outside their Source Hour")
-        if set(table.column("source_day").to_pylist()) != {day_key}:
+        source_day = batch.column("source_day")
+        if (
+            source_day.null_count
+            or pc.all(pc.equal(source_day, day_key)).as_py() is not True
+        ):
             raise FactCorrupt(f"{table_name} rows moved outside their Source Day")
 
     def _hour_path(self, hour: datetime) -> Path:

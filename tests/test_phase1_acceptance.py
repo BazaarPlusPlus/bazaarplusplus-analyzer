@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from bpp_analyzer.bundle_source import (
     Bundle,
@@ -14,35 +16,73 @@ from bpp_analyzer.bundle_source import (
     RawHourIndex,
     raw_commit_sha256,
 )
-from bpp_analyzer.driver import EPOCH_DAY, PipelineDriver, healing_days, is_hour_settled
+from bpp_analyzer.driver import (
+    EPOCH_DAY,
+    PipelineDriver,
+    healing_days,
+    is_hour_settled,
+    peak_rss_bytes,
+)
 from bpp_analyzer.fact_store import FactStore
-from bpp_analyzer.projection import HourProjection, table_schemas
-from tests.bundle_fixtures import bundle_bytes
+from bpp_analyzer.projection import HourProjection, project_hour, table_schemas
+from tests.bundle_fixtures import bundle_bytes, payload
 
 
-class OneBundleSource:
-    def __init__(self) -> None:
-        self.content = bundle_bytes("bundle-a")
+class BusyHourSource:
+    def __init__(
+        self, *, bundle_count: int = 2_500, cards_per_set: int = 25
+    ) -> None:
+        self.bundle_count = bundle_count
+        self.run_payload = payload(cards_per_set=cards_per_set)
 
     def hour_index(self, source_hour: datetime) -> RawHourIndex:
-        ref = BundleRef(
-            bundle_id="bundle-a",
-            available_at_ms=int(source_hour.timestamp() * 1_000),
-            download_url="https://download.invalid/bundle-a",
-            download_expires_at_ms=int(source_hour.timestamp() * 1_000) + 60_000,
-            sha256=hashlib.sha256(self.content).hexdigest(),
-            bytes=len(self.content),
+        available_at_ms = int(source_hour.timestamp() * 1_000)
+        refs = tuple(
+            BundleRef(
+                bundle_id=f"bundle-{index:05d}",
+                available_at_ms=available_at_ms,
+                download_url=f"https://download.invalid/bundle-{index:05d}",
+                download_expires_at_ms=available_at_ms + 60_000,
+                sha256=None,
+                bytes=None,
+            )
+            for index in range(self.bundle_count)
         )
-        return RawHourIndex(source_hour, (ref,), raw_commit_sha256((ref,)), 1)
+        return RawHourIndex(source_hour, refs, raw_commit_sha256(refs), 1)
 
     def stream(self, index: RawHourIndex):
-        ref = index.items[0]
-        yield Bundle(
-            ref,
-            self.content,
-            hashlib.sha256(self.content).hexdigest(),
-            len(self.content),
-        )
+        for ref in index.items:
+            content = bundle_bytes(ref.bundle_id, run_payload=self.run_payload)
+            yield Bundle(
+                ref,
+                content,
+                hashlib.sha256(content).hexdigest(),
+                len(content),
+            )
+
+
+def _measure_busy_hour(root: str, results) -> None:
+    now = datetime(2026, 8, 7, 1, 1, tzinfo=UTC)
+    source = BusyHourSource()
+    baseline_rss = peak_rss_bytes()
+    summary = PipelineDriver(Path(root), source=source, clock=lambda: now).run(
+        heal_days=1
+    )
+    status = json.loads((Path(root) / "status.json").read_bytes())
+    cards_path = (
+        Path(root)
+        / "facts/hourly/source_hour=2026-08-07T00/battle_cards.parquet"
+    )
+    metadata = pq.ParquetFile(cards_path).metadata
+    results.put(
+        {
+            "baseline_rss_bytes": baseline_rss,
+            "peak_rss_bytes": summary.peak_rss_bytes,
+            "status_peak_rss_bytes": status["peak_rss_bytes"],
+            "card_rows": metadata.num_rows,
+            "card_row_groups": metadata.num_row_groups,
+        }
+    )
 
 
 def _empty_projection(hour: datetime) -> HourProjection:
@@ -59,16 +99,51 @@ def _empty_projection(hour: datetime) -> HourProjection:
 def test_hour_ingest_records_and_stays_below_the_one_gib_peak_rss_limit(
     tmp_path: Path,
 ) -> None:
-    now = datetime(2026, 8, 7, 1, 1, tzinfo=UTC)
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    process = context.Process(target=_measure_busy_hour, args=(str(tmp_path), results))
+    process.start()
+    process.join(timeout=60)
 
-    summary = PipelineDriver(
-        tmp_path, source=OneBundleSource(), clock=lambda: now
-    ).run(heal_days=8)
+    if process.is_alive():
+        process.kill()
+        process.join()
+        raise AssertionError("Synthetic hour ingest exceeded 60 seconds")
+    assert process.exitcode == 0
+    measured = results.get(timeout=1)
+    results.close()
+    results.join_thread()
+    assert measured["card_rows"] == 250_000
+    assert measured["card_row_groups"] > 1
+    assert measured["peak_rss_bytes"] < 1024**3
+    assert measured["status_peak_rss_bytes"] == measured["peak_rss_bytes"]
+    assert (
+        measured["peak_rss_bytes"] - measured["baseline_rss_bytes"]
+        < 256 * 1024**2
+    )
 
-    status = json.loads((tmp_path / "status.json").read_text())
-    assert summary.hours_ingested == 1
-    assert summary.peak_rss_bytes < 1024**3
-    assert status["peak_rss_bytes"] < 1024**3
+
+def test_batched_hour_commit_is_byte_deterministic_across_batch_boundaries(
+    tmp_path: Path,
+) -> None:
+    source_hour = datetime(2026, 8, 10, 12, tzinfo=UTC)
+    committed: list[dict[str, bytes]] = []
+
+    for root_name in ("first", "second"):
+        root = tmp_path / root_name
+        source = BusyHourSource(bundle_count=501, cards_per_set=25)
+        index = source.hour_index(source_hour)
+        FactStore(root).commit_hour(project_hour(index, source.stream(index)))
+        hour_path = root / "facts/hourly/source_hour=2026-08-10T12"
+        committed.append(
+            {path.name: path.read_bytes() for path in sorted(hour_path.iterdir())}
+        )
+
+    assert pq.ParquetFile(
+        tmp_path
+        / "first/facts/hourly/source_hour=2026-08-10T12/battle_cards.parquet"
+    ).metadata.num_row_groups == 2
+    assert committed[0] == committed[1]
 
 
 def test_one_source_day_persists_only_parquet_plus_at_most_one_percent_metadata(

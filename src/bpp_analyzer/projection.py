@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import gzip
@@ -19,6 +19,7 @@ from bpp_analyzer.bundle_source import Bundle, BundleSourceError, RawHourIndex, 
 
 PROJECTION_VERSION = "v5-phase1-2"
 MAX_DECOMPRESSED_RUN_BYTES = 64 * 1024 * 1024
+ROW_BATCH_SIZE = 50_000
 
 HERO_ALIASES = {"Hero8": "TheDragons"}
 KNOWN_HEROES = frozenset(
@@ -41,15 +42,86 @@ class RunPayloadError(ValueError):
         self.reason = reason
 
 
-@dataclass(frozen=True, slots=True)
 class HourProjection:
-    source_hour: datetime
-    raw_commit_sha256: str
-    tables: Mapping[str, pa.Table]
-    projection_version: str = PROJECTION_VERSION
+    """One hour's metadata plus either reusable tables or a one-shot batch stream."""
+
+    __slots__ = (
+        "source_hour",
+        "raw_commit_sha256",
+        "projection_version",
+        "_tables",
+        "_batch_stream",
+        "_stream_consumed",
+    )
+
+    def __init__(
+        self,
+        source_hour: datetime,
+        raw_commit_sha256: str,
+        tables: Mapping[str, pa.Table] | None = None,
+        projection_version: str = PROJECTION_VERSION,
+        *,
+        batch_stream: "_ProjectedBatchStream | None" = None,
+    ) -> None:
+        if (tables is None) == (batch_stream is None):
+            raise ValueError("Hour Projection requires tables or a batch stream")
+        self.source_hour = source_hour
+        self.raw_commit_sha256 = raw_commit_sha256
+        self.projection_version = projection_version
+        self._tables = dict(tables) if tables is not None else None
+        self._batch_stream = batch_stream
+        self._stream_consumed = False
+
+    @property
+    def tables(self) -> Mapping[str, pa.Table]:
+        """Materialize Arrow tables for compatibility with small direct consumers."""
+        if self._tables is None:
+            batches: dict[str, list[pa.RecordBatch]] = {
+                name: [] for name in _SCHEMAS
+            }
+            for name, batch in self.iter_batches():
+                try:
+                    batches[name].append(batch)
+                except KeyError as error:
+                    raise ProjectionError(
+                        f"Projection emitted an unknown table: {name}"
+                    ) from error
+            self._tables = {
+                name: pa.Table.from_batches(items, schema=_SCHEMAS[name])
+                for name, items in batches.items()
+            }
+        return self._tables
+
+    @property
+    def table_names(self) -> tuple[str, ...]:
+        return tuple(self._tables) if self._tables is not None else tuple(_SCHEMAS)
+
+    @property
+    def schemas(self) -> Mapping[str, pa.Schema]:
+        if self._tables is not None:
+            return {name: table.schema for name, table in self._tables.items()}
+        return table_schemas()
+
+    def iter_batches(self) -> Iterator[tuple[str, pa.RecordBatch]]:
+        if self._tables is not None:
+            for name, table in self._tables.items():
+                for batch in table.to_batches(max_chunksize=ROW_BATCH_SIZE):
+                    yield name, batch
+            return
+        if self._stream_consumed or self._batch_stream is None:
+            raise ProjectionError("Streaming Hour Projection was already consumed")
+        self._stream_consumed = True
+        yield from self._batch_stream
 
     @property
     def bundle_count(self) -> int:
+        if self._tables is not None:
+            return self._tables["runs"].num_rows + self._tables["quarantine"].num_rows
+        if (
+            self._batch_stream is not None
+            and self._batch_stream.bundle_count is not None
+        ):
+            return self._batch_stream.bundle_count
         return self.tables["runs"].num_rows + self.tables["quarantine"].num_rows
 
 
@@ -151,126 +223,207 @@ def table_schemas() -> Mapping[str, pa.Schema]:
 
 
 def project_hour(index: RawHourIndex, bundles: Iterable[Bundle]) -> HourProjection:
-    """Consume the ordered stream once and account for every indexed Bundle."""
-    rows: dict[str, list[dict[str, object]]] = {name: [] for name in _SCHEMAS}
-    observed_ids: list[str] = []
-    expected_ids = [item.bundle_id for item in index.items]
-    hour_key = index.source_hour.strftime("%Y-%m-%dT%H")
-    day_key = index.source_hour.strftime("%Y-%m-%d")
-    first_seen = (index.source_hour + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    """Return a one-shot, fixed-size batch stream over the ordered Bundles."""
+    return HourProjection(
+        index.source_hour,
+        index.raw_commit_sha256,
+        batch_stream=_ProjectedBatchStream(index, bundles),
+    )
 
-    for downloaded in bundles:
-        observed_ids.append(downloaded.ref.bundle_id)
-        if downloaded.validation_error is not None or downloaded.content is None:
-            rows["quarantine"].append(
-                _quarantine_row(
-                    hour_key,
-                    day_key,
-                    downloaded.ref.bundle_id,
-                    None,
-                    "bundle_validation",
-                    downloaded.validation_error or "bundle_missing",
-                    first_seen,
+
+class _ProjectedBatchStream:
+    __slots__ = ("index", "bundles", "bundle_count")
+
+    def __init__(self, index: RawHourIndex, bundles: Iterable[Bundle]) -> None:
+        self.index = index
+        self.bundles = bundles
+        self.bundle_count: int | None = None
+
+    def __iter__(self) -> Iterator[tuple[str, pa.RecordBatch]]:
+        buffers: dict[str, list[dict[str, object]]] = {
+            name: [] for name in _SCHEMAS
+        }
+        observed_count = 0
+        projected_count = 0
+        hour_key = self.index.source_hour.strftime("%Y-%m-%dT%H")
+        day_key = self.index.source_hour.strftime("%Y-%m-%d")
+        first_seen = (
+            (self.index.source_hour + timedelta(hours=1))
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+        for observed_count, downloaded in enumerate(self.bundles, start=1):
+            if (
+                observed_count > len(self.index.items)
+                or downloaded.ref.bundle_id
+                != self.index.items[observed_count - 1].bundle_id
+            ):
+                raise ProjectionError(
+                    "Bundle stream did not match the complete ordered index"
                 )
-            )
-            continue
-        manifest: Mapping[str, Any] | None = None
-        try:
-            manifest, run_bytes = open_bundle(
-                downloaded.content, expected_bundle_id=downloaded.ref.bundle_id
-            )
-            decoded = decode_run_payload(run_bytes)
-            run_manifest = _object(manifest["run"], "run")
-            run_id = _text(run_manifest.get("run_id"), "run.run_id")
-            account_id = _text(
-                run_manifest.get("player_account_id"), "run.player_account_id"
-            )
-            if decoded[1] != run_id or decoded[2] != account_id:
-                raise RunPayloadError(
-                    "payload_identity_mismatch",
-                    "Run payload and Bundle manifest identities differ",
-                )
-            manifest_projection = _object(run_manifest.get("projection"), "projection")
-            manifest_battles = _array(manifest_projection.get("battles"), "battles")
-            manifest_ids = [
-                _text(_object(item, "battle").get("battle_id"), "battle_id")
-                for item in manifest_battles
-            ]
-            payload_battles = _array(decoded[5], "payload.battles")
-            payload_ids = [
-                _text(_slots(item, 5, "battle")[0], "battle_id")
-                for item in payload_battles
-            ]
-            if len(payload_ids) != len(set(payload_ids)):
-                raise RunPayloadError(
-                    "duplicate_payload_battle_id", "Run payload repeats a Battle ID"
-                )
-            if any(item not in set(payload_ids) for item in manifest_ids):
-                raise RunPayloadError(
-                    "manifest_payload_battle_mismatch",
-                    "A manifest Battle is absent from the payload",
-                )
-            projected = _project_valid_bundle(
-                index,
+            rows = _project_bundle_rows(
                 downloaded,
-                manifest,
-                decoded,
                 hour_key=hour_key,
                 day_key=day_key,
+                first_seen=first_seen,
             )
-            for table_name, projected_rows in projected.items():
-                rows[table_name].extend(projected_rows)
-        except (
-            BundleSourceError,
-            RunPayloadError,
-            KeyError,
-            TypeError,
-            ValueError,
-        ) as error:
-            reason = (
-                error.reason
-                if isinstance(error, (BundleSourceError, RunPayloadError))
-                else "run_payload_decode_failed"
-            )
-            run_id = None
-            try:
-                if manifest is not None:
-                    run_id = _object(manifest["run"], "run").get("run_id")
-            except (KeyError, TypeError, ValueError):
-                pass
-            rows["quarantine"].append(
-                _quarantine_row(
-                    hour_key,
-                    day_key,
-                    downloaded.ref.bundle_id,
-                    run_id if isinstance(run_id, str) else None,
-                    "run_payload_decode",
-                    reason,
-                    first_seen,
+            bundle_accounted = 0
+            for table_name, row in rows:
+                if table_name in ("runs", "quarantine"):
+                    bundle_accounted += 1
+                buffer = buffers[table_name]
+                buffer.append(row)
+                if len(buffer) == ROW_BATCH_SIZE:
+                    buffers[table_name] = []
+                    yield table_name, pa.RecordBatch.from_pylist(
+                        buffer, schema=_SCHEMAS[table_name]
+                    )
+            if bundle_accounted != 1:
+                raise ProjectionError("Bundle projection accounting is incomplete")
+            projected_count += bundle_accounted
+
+        if observed_count != len(self.index.items):
+            raise ProjectionError("Bundle stream did not match the complete ordered index")
+        if projected_count != len(self.index.items):
+            raise ProjectionError("Bundle projection accounting is incomplete")
+        for table_name, buffer in buffers.items():
+            if buffer:
+                yield table_name, pa.RecordBatch.from_pylist(
+                    buffer, schema=_SCHEMAS[table_name]
                 )
+        self.bundle_count = projected_count
+
+
+def _project_bundle_rows(
+    downloaded: Bundle,
+    *,
+    hour_key: str,
+    day_key: str,
+    first_seen: str,
+) -> Iterator[tuple[str, dict[str, object]]]:
+    if downloaded.validation_error is not None or downloaded.content is None:
+        yield "quarantine", _quarantine_row(
+            hour_key,
+            day_key,
+            downloaded.ref.bundle_id,
+            None,
+            "bundle_validation",
+            downloaded.validation_error or "bundle_missing",
+            first_seen,
+        )
+        return
+    manifest: Mapping[str, Any] | None = None
+    try:
+        manifest, run_bytes = open_bundle(
+            downloaded.content, expected_bundle_id=downloaded.ref.bundle_id
+        )
+        decoded = decode_run_payload(run_bytes)
+        run_manifest = _object(manifest["run"], "run")
+        run_id = _text(run_manifest.get("run_id"), "run.run_id")
+        account_id = _text(
+            run_manifest.get("player_account_id"), "run.player_account_id"
+        )
+        if decoded[1] != run_id or decoded[2] != account_id:
+            raise RunPayloadError(
+                "payload_identity_mismatch",
+                "Run payload and Bundle manifest identities differ",
             )
+        manifest_projection = _object(run_manifest.get("projection"), "projection")
+        manifest_battles = _array(manifest_projection.get("battles"), "battles")
+        manifest_ids = [
+            _text(_object(item, "battle").get("battle_id"), "battle_id")
+            for item in manifest_battles
+        ]
+        payload_battles = _array(decoded[5], "payload.battles")
+        payload_ids = [
+            _text(_slots(item, 5, "battle")[0], "battle_id")
+            for item in payload_battles
+        ]
+        payload_id_set = set(payload_ids)
+        if len(payload_ids) != len(payload_id_set):
+            raise RunPayloadError(
+                "duplicate_payload_battle_id", "Run payload repeats a Battle ID"
+            )
+        if any(item not in payload_id_set for item in manifest_ids):
+            raise RunPayloadError(
+                "manifest_payload_battle_mismatch",
+                "A manifest Battle is absent from the payload",
+            )
+        projected = _prepare_valid_bundle(
+            downloaded,
+            manifest,
+            decoded,
+            hour_key=hour_key,
+            day_key=day_key,
+        )
+    except (
+        BundleSourceError,
+        RunPayloadError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as error:
+        reason = (
+            error.reason
+            if isinstance(error, (BundleSourceError, RunPayloadError))
+            else "run_payload_decode_failed"
+        )
+        run_id = None
+        try:
+            if manifest is not None:
+                run_id = _object(manifest["run"], "run").get("run_id")
+        except (KeyError, TypeError, ValueError):
+            pass
+        yield "quarantine", _quarantine_row(
+            hour_key,
+            day_key,
+            downloaded.ref.bundle_id,
+            run_id if isinstance(run_id, str) else None,
+            "run_payload_decode",
+            reason,
+            first_seen,
+        )
+        return
+    yield from projected.rows()
 
-    if observed_ids != expected_ids:
-        raise ProjectionError("Bundle stream did not match the complete ordered index")
-    projected_count = len(rows["runs"]) + len(rows["quarantine"])
-    if projected_count != len(expected_ids):
-        raise ProjectionError("Bundle projection accounting is incomplete")
-    tables = {
-        name: pa.Table.from_pylist(table_rows, schema=_SCHEMAS[name])
-        for name, table_rows in rows.items()
-    }
-    return HourProjection(index.source_hour, index.raw_commit_sha256, tables)
+
+@dataclass(frozen=True, slots=True)
+class _BattleSummary:
+    wins: int
+    losses: int
+    heroes: frozenset[str]
+    ranks: frozenset[str]
+    recorded_in_future: bool
+    recorded_before_run: bool
 
 
-def _project_valid_bundle(
-    index: RawHourIndex,
+@dataclass(frozen=True, slots=True)
+class _ValidBundleProjection:
+    base: Mapping[str, object]
+    run: Mapping[str, object]
+    battles: Sequence[tuple[Any, ...]]
+    replayable_ids: Sequence[str]
+    quality: Sequence[dict[str, object]]
+
+    def rows(self) -> Iterator[tuple[str, dict[str, object]]]:
+        yield "runs", dict(self.run)
+        for battle in self.battles:
+            yield "battles", _battle_row(self.base, battle, self.replayable_ids)
+            for card in _card_rows(self.base, battle):
+                yield "battle_cards", card
+        for row in self.quality:
+            yield "quality", row
+
+
+def _prepare_valid_bundle(
     downloaded: Bundle,
     manifest: Mapping[str, Any],
     payload: tuple[Any, ...],
     *,
     hour_key: str,
     day_key: str,
-) -> dict[str, list[dict[str, object]]]:
+) -> _ValidBundleProjection:
     run_id = _text(payload[1], "run_id")
     account_id = _text(payload[2], "player_account_id")
     run = _slots(payload[3], 22, "run")
@@ -291,21 +444,55 @@ def _project_valid_bundle(
         "run_id": run_id,
     }
 
-    battle_rows = [
-        _battle_row(base, battle, replayable_ids) for battle in battles
-    ]
-    card_rows = [
-        card
-        for battle in battles
-        for card in _card_rows(base, battle)
-    ]
+    wins = 0
+    losses = 0
+    heroes: set[str] = set()
+    ranks: set[str] = set()
+    recorded_in_future = False
+    recorded_before_run = False
+    available = datetime.fromtimestamp(available_at_ms / 1_000, tz=UTC)
+    started = _parse_time(_text(run[3], "run.started_at"))
+    for battle in battles:
+        battle_row = _battle_row(base, battle, replayable_ids)
+        wins += battle_row["winner_side"] == "player"
+        losses += battle_row["winner_side"] == "opponent"
+        heroes.update(
+            value
+            for value in (
+                battle_row["player_hero"],
+                battle_row["opponent_hero"],
+            )
+            if isinstance(value, str)
+        )
+        ranks.update(
+            value
+            for value in (
+                battle_row["player_rank"],
+                battle_row["opponent_rank"],
+            )
+            if isinstance(value, str)
+        )
+        recorded = _parse_time(battle_row["recorded_at_utc"])
+        recorded_in_future |= recorded is not None and recorded > available
+        recorded_before_run |= (
+            recorded is not None and started is not None and recorded < started
+        )
+        for _card in _card_rows(base, battle):
+            pass
+    summary = _BattleSummary(
+        wins,
+        losses,
+        frozenset(heroes),
+        frozenset(ranks),
+        recorded_in_future,
+        recorded_before_run,
+    )
     finals = [
         battle
         for battle in battles
         if _boolean(_slots(battle[1], 9, "battle.facts")[8], "is_final")
     ]
     final = finals[0] if len(finals) == 1 else None
-    decided = [row for row in battle_rows if row["winner_side"] is not None]
     run_row = {
         **base,
         "bundle_sha256": downloaded.sha256,
@@ -337,9 +524,9 @@ def _project_valid_bundle(
         "mod_version": _text(run[21], "run.mod_version"),
         "battle_count": len(battles),
         "replayable_battle_count": len(replayable_ids),
-        "battle_decided_count": len(decided),
-        "battle_player_win_count": sum(row["winner_side"] == "player" for row in decided),
-        "battle_player_loss_count": sum(row["winner_side"] == "opponent" for row in decided),
+        "battle_decided_count": wins + losses,
+        "battle_player_win_count": wins,
+        "battle_player_loss_count": losses,
         "final_battle_id": _text(final[0], "battle_id") if final else None,
         "final_player_item_signature": _card_signature(final, "player_hand"),
         "final_opponent_item_signature": _card_signature(final, "opponent_hand"),
@@ -352,18 +539,12 @@ def _project_valid_bundle(
     quality = _quality_rows(
         base,
         run_row,
-        battle_rows,
+        summary,
         battles,
         replayable_ids,
         degradation,
     )
-    return {
-        "runs": [run_row],
-        "battles": battle_rows,
-        "battle_cards": card_rows,
-        "quality": quality,
-        "quarantine": [],
-    }
+    return _ValidBundleProjection(base, run_row, battles, replayable_ids, quality)
 
 
 def _battle_row(
@@ -436,11 +617,10 @@ def _participant(prefix: str, participant: tuple[Any, ...]) -> dict[str, object]
 
 def _card_rows(
     base: Mapping[str, object], battle: tuple[Any, ...]
-) -> list[dict[str, object]]:
+) -> Iterator[dict[str, object]]:
     if battle[3] is None:
-        return []
+        return
     snapshots = _slots(battle[3], 1, "battle.snapshots")
-    output: list[dict[str, object]] = []
     for raw_set in _array(snapshots[0], "battle.card_sets"):
         card_set = _slots(raw_set, 4, "battle.card_set")
         label = _text(card_set[0], "card_set.label")
@@ -461,30 +641,27 @@ def _card_rows(
         for slot_index, raw_card in enumerate(_array(card_set[3], "card_set.cards")):
             card = _slots(raw_card, 11, "battle.card")
             attributes = _object(card[10], "card.attributes")
-            output.append(
-                {
-                    **base,
-                    "battle_id": _text(battle[0], "battle_id"),
-                    "card_set_label": label,
-                    "card_set_status": _nullable_text(card_set[1], "card_set.status"),
-                    "card_set_source": _nullable_text(card_set[2], "card_set.source"),
-                    "owner_side": owner,
-                    "card_kind": kind,
-                    "slot_index": slot_index,
-                    "instance_id": _text(card[0], "card.instance_id"),
-                    "template_id": _text(card[1], "card.template_id"),
-                    "card_type": _integer(card[2], "card.type"),
-                    "size": _integer(card[3], "card.size"),
-                    "section": _nullable_integer(card[4], "card.section"),
-                    "socket": _nullable_integer(card[5], "card.socket"),
-                    "name": _nullable_text(card[6], "card.name"),
-                    "tier": _nullable_text(card[7], "card.tier"),
-                    "enchantment": _nullable_text(card[8], "card.enchantment"),
-                    "tags_json": _json(_array(card[9], "card.tags")),
-                    "attributes_json": _json(attributes),
-                }
-            )
-    return output
+            yield {
+                **base,
+                "battle_id": _text(battle[0], "battle_id"),
+                "card_set_label": label,
+                "card_set_status": _nullable_text(card_set[1], "card_set.status"),
+                "card_set_source": _nullable_text(card_set[2], "card_set.source"),
+                "owner_side": owner,
+                "card_kind": kind,
+                "slot_index": slot_index,
+                "instance_id": _text(card[0], "card.instance_id"),
+                "template_id": _text(card[1], "card.template_id"),
+                "card_type": _integer(card[2], "card.type"),
+                "size": _integer(card[3], "card.size"),
+                "section": _nullable_integer(card[4], "card.section"),
+                "socket": _nullable_integer(card[5], "card.socket"),
+                "name": _nullable_text(card[6], "card.name"),
+                "tier": _nullable_text(card[7], "card.tier"),
+                "enchantment": _nullable_text(card[8], "card.enchantment"),
+                "tags_json": _json(_array(card[9], "card.tags")),
+                "attributes_json": _json(attributes),
+            }
 
 
 def _card_sets(battle: tuple[Any, ...] | None) -> dict[str, tuple[Any, ...]]:
@@ -538,7 +715,7 @@ def _replay_available(battle: tuple[Any, ...], replayable_ids: Sequence[str]) ->
 def _quality_rows(
     base: Mapping[str, object],
     run: Mapping[str, object],
-    battle_rows: Sequence[Mapping[str, object]],
+    battle_summary: _BattleSummary,
     battles: Sequence[tuple[Any, ...]],
     replayable_ids: Sequence[str],
     degradation: tuple[Any, ...],
@@ -547,8 +724,8 @@ def _quality_rows(
     payload_ids = {_text(battle[0], "battle_id") for battle in battles}
     if not set(replayable_ids).issubset(payload_ids):
         findings["run_battle_count_mismatch"] = {}
-    wins = sum(row["winner_side"] == "player" for row in battle_rows)
-    losses = sum(row["winner_side"] == "opponent" for row in battle_rows)
+    wins = battle_summary.wins
+    losses = battle_summary.losses
     if run["victories"] is not None and run["losses"] is not None and (
         run["victories"] != wins or run["losses"] != losses
     ):
@@ -565,22 +742,13 @@ def _quality_rows(
         findings["multiple_final_battles"] = {"count": len(finals)}
     elif _card_signature(finals[0], "player_hand") is None:
         findings["final_player_hand_missing"] = {}
-    heroes = {run["hero"]} | {
-        row[key]
-        for row in battle_rows
-        for key in ("player_hero", "opponent_hero")
-        if row[key] is not None
-    }
+    heroes = {run["hero"]} | set(battle_summary.heroes)
     unknown_heroes = sorted(
         str(value) for value in heroes if value not in KNOWN_HEROES
     )
     if unknown_heroes:
         findings["unknown_hero"] = {"values": unknown_heroes}
-    ranks = {run["initial_rank"], run["final_rank"]} | {
-        row[key]
-        for row in battle_rows
-        for key in ("player_rank", "opponent_rank")
-    }
+    ranks = {run["initial_rank"], run["final_rank"]} | set(battle_summary.ranks)
     unknown_ranks = sorted(
         str(value)
         for value in ranks
@@ -595,17 +763,12 @@ def _quality_rows(
             None,
             [_parse_time(run["started_at_utc"]), _parse_time(run["ended_at_utc"])],
         ),
-        *filter(None, (_parse_time(row["recorded_at_utc"]) for row in battle_rows)),
     ]
-    if any(value > available for value in observed):
-        findings["client_clock_future"] = {}
-    started = _parse_time(run["started_at_utc"])
-    if started is not None and any(
-        value < started
-        for value in filter(
-            None, (_parse_time(row["recorded_at_utc"]) for row in battle_rows)
-        )
+    if battle_summary.recorded_in_future or any(
+        value > available for value in observed
     ):
+        findings["client_clock_future"] = {}
+    if battle_summary.recorded_before_run:
         findings["client_clock_before_run"] = {}
     if _array(degradation[1], "degradation.replays"):
         findings["degraded_replay"] = {}
