@@ -12,23 +12,15 @@ from typing import Any
 import duckdb
 from jsonschema import Draft202012Validator
 
+from bppanalyzer.accepted_runs import (
+    CANONICAL_HEROES,
+    normalize_hero_sql,
+    population_projection_sql,
+    recognized_hero_sql,
+)
 from bppanalyzer.fact_store import DaySeal, FactStore, canonical_json, parse_source_day
 from bppanalyzer.object_store import ObjectStore
 
-CANONICAL_HEROES = (
-    "Dooley",
-    "Jules",
-    "Karnok",
-    "Mak",
-    "Pygmalien",
-    "Stelle",
-    "TheDragons",
-    "Vanessa",
-)
-CANONICAL_RANKS = frozenset(
-    {"Bronze", "Silver", "Gold", "Diamond", "Master", "Masters", "Legendary"}
-)
-LEGEND_RANK = "Legendary"
 ANALYSIS_DAYS = 7
 CORE_BUILD_LIMIT_PER_HERO = 500
 WILSON_Z = 1.96
@@ -192,7 +184,7 @@ class SnapshotBuilder:
                 """
             ).fetchall()
             matchup_rows = connection.execute(
-                """
+                f"""
                 SELECT r.source_day, r.hero_norm, r.segment, b.opponent_hero_norm,
                        count(*) AS decided,
                        count(*) FILTER (WHERE b.winner_side_norm='player') AS wins,
@@ -201,9 +193,7 @@ class SnapshotBuilder:
                 JOIN completed_runs r
                   ON r.bundle_id=b.bundle_id AND r.run_id=b.run_id
                 WHERE b.winner_side_norm IN ('player','opponent')
-                  AND b.opponent_hero_norm IN (
-                    'Dooley','Jules','Karnok','Mak','Pygmalien','Stelle','TheDragons','Vanessa'
-                  )
+                  AND {recognized_hero_sql("b.opponent_hero")}
                 GROUP BY r.source_day, r.hero_norm, r.segment, b.opponent_hero_norm
                 ORDER BY r.source_day DESC, r.hero_norm, r.segment, b.opponent_hero_norm
                 """
@@ -281,25 +271,10 @@ class SnapshotBuilder:
                 connection.execute(
                     """
                 SELECT count(*) AS raw_runs,
-                       count(*) FILTER (
-                         WHERE (CASE WHEN trim(hero)='Hero8' THEN 'TheDragons'
-                                     ELSE trim(hero) END) NOT IN
-                           ('Dooley','Jules','Karnok','Mak','Pygmalien','Stelle',
-                            'TheDragons','Vanessa')
-                       ) AS unknown_hero,
-                       count(*) FILTER (
-                         WHERE final_rank IS NULL OR trim(final_rank) NOT IN
-                           ('Bronze','Silver','Gold','Diamond','Master','Masters','Legendary')
-                       ) AS unknown_final_rank,
-                       count(*) FILTER (
-                         WHERE (CASE WHEN trim(hero)='Hero8' THEN 'TheDragons'
-                                     ELSE trim(hero) END) IN
-                           ('Dooley','Jules','Karnok','Mak','Pygmalien','Stelle',
-                            'TheDragons','Vanessa')
-                           AND trim(final_rank) IN
-                           ('Bronze','Silver','Gold','Diamond','Master','Masters','Legendary')
-                       ) AS included_runs
-                FROM runs_fact
+                       count(*) FILTER (WHERE NOT hero_recognized) AS unknown_hero,
+                       count(*) FILTER (WHERE NOT final_rank_recognized) AS unknown_final_rank,
+                       count(*) FILTER (WHERE accepted) AS included_runs
+                FROM run_population
                 """
                 ).fetchone(),
                 "Run counts",
@@ -575,16 +550,11 @@ class SnapshotBuilder:
                     f"SELECT * FROM read_parquet([{explicit}], hive_partitioning=false, "
                     f"union_by_name=true)"
                 )
-            heroes = ",".join(_sql_string(hero) for hero in CANONICAL_HEROES)
-            ranks = ",".join(_sql_string(rank) for rank in sorted(CANONICAL_RANKS))
             connection.execute(
-                "CREATE TEMP VIEW accepted_runs AS "
-                "SELECT *, CASE WHEN trim(hero)='Hero8' THEN 'TheDragons' "
-                "ELSE trim(hero) END AS hero_norm, "
-                "CASE WHEN trim(final_rank)='Legendary' THEN 'legend' "
-                "ELSE 'non_legend' END AS segment FROM runs_fact "
-                f"WHERE (CASE WHEN trim(hero)='Hero8' THEN 'TheDragons' ELSE trim(hero) END) "
-                f"IN ({heroes}) AND trim(final_rank) IN ({ranks})"
+                "CREATE TEMP VIEW run_population AS " + population_projection_sql("runs_fact")
+            )
+            connection.execute(
+                "CREATE TEMP VIEW accepted_runs AS SELECT * FROM run_population WHERE accepted"
             )
             connection.execute(
                 "CREATE TEMP VIEW completed_runs AS SELECT * FROM accepted_runs "
@@ -593,8 +563,7 @@ class SnapshotBuilder:
             if "battles" in tables:
                 connection.execute(
                     "CREATE TEMP VIEW accepted_battles AS "
-                    "SELECT *, CASE WHEN trim(opponent_hero)='Hero8' THEN 'TheDragons' "
-                    "ELSE trim(opponent_hero) END AS opponent_hero_norm, "
+                    f"SELECT *, {normalize_hero_sql('opponent_hero')} AS opponent_hero_norm, "
                     "CASE WHEN winner_combatant_id='Player' THEN 'player' "
                     "WHEN winner_combatant_id='Opponent' THEN 'opponent' "
                     "WHEN winner_combatant_id IS NOT NULL "

@@ -75,3 +75,10 @@ Ten-Win Runs.
 **Build Corpus**:
 The current set of selected Build Identities and their Representative Layouts
 used by the Mod for recommendation recall and ranking.
+
+## Operations
+
+**Operational Evidence**:
+Local records of pipeline progress and outcomes used by operators to understand
+the current Run, the last completed Run, and recent Run history. It is not
+consumer data.

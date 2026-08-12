@@ -12,17 +12,18 @@ from typing import Any, cast
 
 import pyarrow as pa
 
-from bppanalyzer.bundle_source import Bundle, BundleSourceError, RawHourIndex, open_bundle
+from bppanalyzer.accepted_runs import (
+    CANONICAL_HEROES,
+    CANONICAL_RANKS,
+    RunAdmission,
+    admit_run,
+    normalize_hero,
+)
+from bppanalyzer.bundle_source import Bundle, RawHourIndex
 
 PROJECTION_VERSION = "v5-consumer-contract-1"
 MAX_DECOMPRESSED_RUN_BYTES = 64 * 1024 * 1024
 ROW_BATCH_SIZE = 50_000
-
-HERO_ALIASES = {"Hero8": "TheDragons"}
-KNOWN_HEROES = frozenset(
-    {"Stelle", "Mak", "Jules", "Dooley", "Karnok", "Pygmalien", "Vanessa", "TheDragons"}
-)
-KNOWN_RANKS = frozenset({"Bronze", "Silver", "Gold", "Diamond", "Master", "Masters", "Legendary"})
 
 
 class ProjectionError(RuntimeError):
@@ -344,26 +345,9 @@ def _project_bundle_rows(
     day_key: str,
     first_seen: str,
 ) -> Iterator[tuple[str, dict[str, object]]]:
-    if downloaded.validation_error is not None or downloaded.content is None:
-        yield (
-            "quarantine",
-            _quarantine_row(
-                hour_key,
-                day_key,
-                downloaded.ref.bundle_id,
-                None,
-                "bundle_validation",
-                downloaded.validation_error or "bundle_missing",
-                first_seen,
-            ),
-        )
-        return
-    manifest: Mapping[str, Any] | None = None
+    manifest: Mapping[str, Any] | None = downloaded.manifest
     try:
-        manifest, run_bytes = open_bundle(
-            downloaded.content, expected_bundle_id=downloaded.ref.bundle_id
-        )
-        decoded = decode_run_payload(run_bytes)
+        decoded = decode_run_payload(downloaded.run_content)
         run_manifest = _object(manifest["run"], "run")
         run_id = _text(run_manifest.get("run_id"), "run.run_id")
         account_id = _text(run_manifest.get("player_account_id"), "run.player_account_id")
@@ -389,11 +373,8 @@ def _project_bundle_rows(
                 "A manifest Battle is absent from the payload",
             )
         run = _slots(decoded[3], 22, "run")
-        hero = _hero(_text(run[0], "run.hero"))
-        final_rank = _normalized_rank(_nullable_text(run[12], "run.final_rank"))
-        unknown_hero = hero not in KNOWN_HEROES
-        unknown_final_rank = final_rank not in KNOWN_RANKS
-        if unknown_hero or unknown_final_rank:
+        admission = admit_run(_text(run[0], "run.hero"), _nullable_text(run[12], "run.final_rank"))
+        if not admission.accepted:
             yield (
                 "quarantine",
                 _quarantine_row(
@@ -405,9 +386,9 @@ def _project_bundle_rows(
                     "unaccepted_run",
                     first_seen,
                     raw_run=True,
-                    discarded_unknown_hero=unknown_hero,
-                    discarded_unknown_final_rank=unknown_final_rank,
-                    detail={"hero": hero, "final_rank": final_rank},
+                    discarded_unknown_hero=admission.unknown_hero,
+                    discarded_unknown_final_rank=admission.unknown_final_rank,
+                    detail={"hero": admission.hero, "final_rank": admission.final_rank},
                 ),
             )
             return
@@ -415,21 +396,17 @@ def _project_bundle_rows(
             downloaded,
             manifest,
             decoded,
+            admission,
             hour_key=hour_key,
             day_key=day_key,
         )
     except (
-        BundleSourceError,
         RunPayloadError,
         KeyError,
         TypeError,
         ValueError,
     ) as error:
-        reason = (
-            error.reason
-            if isinstance(error, (BundleSourceError, RunPayloadError))
-            else "run_payload_decode_failed"
-        )
+        reason = error.reason if isinstance(error, RunPayloadError) else "run_payload_decode_failed"
         run_id = None
         try:
             if manifest is not None:
@@ -484,6 +461,7 @@ def _prepare_valid_bundle(
     downloaded: Bundle,
     manifest: Mapping[str, Any],
     payload: tuple[Any, ...],
+    admission: RunAdmission,
     *,
     hour_key: str,
     day_key: str,
@@ -555,7 +533,7 @@ def _prepare_valid_bundle(
         "bundle_sha256": downloaded.sha256,
         "player_account_id": account_id,
         "client_created_at_ms": _integer(manifest.get("created_at_ms"), "created_at_ms"),
-        "hero": _hero(_text(run[0], "run.hero")),
+        "hero": admission.hero,
         "game_mode": _text(run[1], "run.game_mode").strip(),
         "seed": _nullable_integer(run[2], "run.seed"),
         "started_at_utc": _text(run[3], "run.started_at"),
@@ -567,7 +545,7 @@ def _prepare_valid_bundle(
         "losses": _nullable_integer(run[9], "run.losses"),
         "initial_rank": _nullable_text(run[10], "run.initial_rank"),
         "initial_rating": _nullable_integer(run[11], "run.initial_rating"),
-        "final_rank": _normalized_rank(_nullable_text(run[12], "run.final_rank")),
+        "final_rank": admission.final_rank,
         "final_rating": _nullable_integer(run[13], "run.final_rating"),
         "final_rating_delta": _nullable_integer(run[14], "run.final_rating_delta"),
         "final_health": _nullable_integer(run[15], "run.final_health"),
@@ -615,10 +593,10 @@ def _battle_row(
     winner_id = _nullable_text(facts[6], "battle.winner_id")
     if winner_id == "Player" or (winner_id is not None and winner_id == player_id):
         winner_side = "player"
-        winner_hero = _hero(_nullable_text(player[2], "player.hero"))
+        winner_hero = normalize_hero(_nullable_text(player[2], "player.hero"))
     elif winner_id == "Opponent" or (winner_id is not None and winner_id == opponent_id):
         winner_side = "opponent"
-        winner_hero = _hero(_nullable_text(opponent[2], "opponent.hero"))
+        winner_hero = normalize_hero(_nullable_text(opponent[2], "opponent.hero"))
     else:
         winner_side = None
         winner_hero = None
@@ -649,7 +627,7 @@ def _participant(prefix: str, participant: tuple[Any, ...]) -> dict[str, object]
     return {
         f"{prefix}_account_id": _nullable_text(participant[0], f"{prefix}.account_id"),
         f"{prefix}_display_name": _nullable_text(participant[1], f"{prefix}.display_name"),
-        f"{prefix}_hero": _hero(_nullable_text(participant[2], f"{prefix}.hero")),
+        f"{prefix}_hero": normalize_hero(_nullable_text(participant[2], f"{prefix}.hero")),
         f"{prefix}_rank": _nullable_text(participant[3], f"{prefix}.rank"),
         f"{prefix}_rating": _nullable_integer(participant[4], f"{prefix}.rating"),
         f"{prefix}_level": _nullable_integer(participant[5], f"{prefix}.level"),
@@ -787,12 +765,12 @@ def _quality_rows(
     elif _card_signature(finals[0], "player_hand") is None:
         findings["final_player_hand_missing"] = {}
     heroes = {run["hero"]} | set(battle_summary.heroes)
-    unknown_heroes = sorted(str(value) for value in heroes if value not in KNOWN_HEROES)
+    unknown_heroes = sorted(str(value) for value in heroes if value not in CANONICAL_HEROES)
     if unknown_heroes:
         findings["unknown_hero"] = {"values": unknown_heroes}
     ranks = {run["initial_rank"], run["final_rank"]} | set(battle_summary.ranks)
     unknown_ranks = sorted(
-        str(value) for value in ranks if value is not None and value not in KNOWN_RANKS
+        str(value) for value in ranks if value is not None and value not in CANONICAL_RANKS
     )
     if unknown_ranks:
         findings["unknown_rank"] = {"values": unknown_ranks}
@@ -1004,17 +982,6 @@ def _boolean(value: object, field: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{field} must be boolean")
     return value
-
-
-def _hero(value: str | None) -> str | None:
-    if value is None:
-        return None
-    normalized = value.strip()
-    return HERO_ALIASES.get(normalized, normalized)
-
-
-def _normalized_rank(value: str | None) -> str | None:
-    return value.strip() if value is not None else None
 
 
 def _parse_time(value: object) -> datetime | None:

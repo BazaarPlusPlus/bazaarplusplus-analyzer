@@ -2,69 +2,46 @@
 
 import json
 import os
-import resource
-import shutil
-import sys
 import tempfile
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol
 
 from bppanalyzer.bundle_source import (
-    Bundle,
     HourExpired,
-    RawHourIndex,
     RetryableSourceError,
 )
 from bppanalyzer.fact_store import FactStore, parse_source_day
+from bppanalyzer.hour_intake import (
+    DEFAULT_SETTLE_LAG,
+    Source,
+    SourceHourIntake,
+    healing_days,
+    settled_missing_hours,
+)
 from bppanalyzer.locking import DirectoryLock, LockOwnershipLost, MaximumRunTimeExceeded
 from bppanalyzer.object_store import ObjectStore
-from bppanalyzer.projection import project_hour
+from bppanalyzer.operational_evidence import (
+    CurrentRun,
+    OperationalEvidence,
+    RunReport,
+    RunReportValue,
+    RunSummary,
+    peak_rss_bytes,
+)
 from bppanalyzer.publication import (
     AnalysisWindow,
-    BuildStats,
     BuiltSnapshot,
-    FactStats,
-    HeroStats,
     LatestPublisher,
     SnapshotBuilder,
     select_analysis_window,
 )
 
 DEFAULT_HEAL_DAYS = 8
-DEFAULT_SETTLE_LAG = timedelta(seconds=60)
 BUNDLE_PROGRESS_EVERY = 250
-
-
-class Source(Protocol):
-    def hour_index(self, source_hour: datetime) -> RawHourIndex: ...
-
-    def stream(self, index: RawHourIndex): ...
-
-
-@dataclass(frozen=True, slots=True)
-class RunSummary:
-    run_id: str
-    started_at: str
-    finished_at: str
-    timings: dict[str, float]
-    outcome: str
-    exit_code: int
-    hours_ingested: int
-    days_sealed: int
-    days_abandoned: int
-    failures: tuple[dict[str, str], ...]
-    report: dict[str, Any]
-    peak_rss_bytes: int
-
-    def to_dict(self) -> dict[str, Any]:
-        value = asdict(self)
-        value["failures"] = list(self.failures)
-        return value
 
 
 @dataclass(slots=True)
@@ -79,6 +56,13 @@ class _RunProgress:
     failures: list[dict[str, str]] = field(default_factory=list)
     changed: bool = False
     heal_started_monotonic: float | None = None
+    listing_pages: int = 0
+    source_index_seconds: float = 0.0
+    source_ingest_seconds: float = 0.0
+    batch_generation_seconds: float = 0.0
+    parquet_write_seconds: float = 0.0
+    fact_finalize_seconds: float = 0.0
+    product_timings: dict[str, float] = field(default_factory=dict)
 
 
 class PipelineDriver:
@@ -145,7 +129,7 @@ class PipelineDriver:
                 days_sealed=0,
                 days_abandoned=0,
                 failures=(),
-                report=_empty_report(None, _RunProgress()),
+                report=_run_report(None, _RunProgress()).value,
                 elapsed=0.0,
             )
 
@@ -159,29 +143,30 @@ class PipelineDriver:
         with lock:
             started_monotonic = time.monotonic()
             progress = _RunProgress()
+            _reset_source_performance(self.source)
             store = FactStore(
                 self.data_root,
                 clock=self.clock,
                 ownership_check=lock.assert_owned,
                 fault_injector=self.fact_fault_injector,
             )
-            run_log = _RunLog(
+            evidence = OperationalEvidence(
                 self.data_root,
                 run_id,
                 clock=self.clock,
                 ownership_check=lock.assert_owned,
             )
-            run_log.write("run started")
+            evidence.log("run started")
             if lock.stale_run_id is not None:
-                run_log.write(f"stale lock taken over: {lock.stale_run_id}")
+                evidence.log(f"stale lock taken over: {lock.stale_run_id}")
 
             def report(message: str) -> None:
-                run_log.write(message)
+                evidence.log(message)
                 if progress_callback is not None:
                     progress_callback(message)
 
             def report_error(message: str) -> None:
-                run_log.write(message)
+                evidence.log(message)
                 if error_callback is not None:
                     error_callback(message)
 
@@ -194,29 +179,28 @@ class PipelineDriver:
                 bundles_total: int | None = None,
             ) -> None:
                 try:
-                    _write_current_status(
-                        self.data_root,
+                    evidence.checkpoint(
                         store,
-                        run_id=run_id,
-                        phase=phase,
-                        step=step,
-                        current_hour=current_hour,
-                        hours_done=progress.hours_ingested,
-                        hours_planned=progress.hours_planned,
-                        bundles_done=bundles_done,
-                        bundles_total=bundles_total,
-                        started_at=now,
-                        now=_aware_utc(self.clock()),
+                        CurrentRun(
+                            phase=phase,
+                            step=step,
+                            current_hour=current_hour,
+                            hours_done=progress.hours_ingested,
+                            hours_planned=progress.hours_planned,
+                            bundles_done=bundles_done,
+                            bundles_total=bundles_total,
+                            started_at=now,
+                            updated_at=_aware_utc(self.clock()),
+                        ),
                         considered_days=healing_days(
                             now, heal_days, source_epoch=self.source_epoch
                         ),
                         source_epoch=self.source_epoch,
-                        ownership_check=lock.assert_owned,
                     )
                 except LockOwnershipLost:
                     raise
                 except BaseException as error:
-                    _try_log(run_log, f"live status refresh failed: {_error_reason(error)}")
+                    evidence.try_log(f"live status refresh failed: {_error_reason(error)}")
 
             summary: RunSummary | None = None
             pending_error: BaseException | None = None
@@ -230,7 +214,7 @@ class PipelineDriver:
                     heal_days=heal_days,
                     started_monotonic=started_monotonic,
                     progress=progress,
-                    log=run_log.write,
+                    log=evidence.log,
                     report=report,
                     report_error=report_error,
                     checkpoint=checkpoint,
@@ -259,6 +243,7 @@ class PipelineDriver:
                     finished_at=_timestamp(self.clock()),
                     timings={
                         **summary.timings,
+                        **_performance_timings(progress, self.source),
                         "total_seconds": round(max(time.monotonic() - started_monotonic, 0.0), 6),
                         "build_publish_seconds": round(
                             max(time.monotonic() - build_started, 0.0), 6
@@ -268,10 +253,18 @@ class PipelineDriver:
                     report=run_report,
                     peak_rss_bytes=peak_rss_bytes(),
                 )
-                run_log.write(
+                evidence.log(
+                    "performance report: "
+                    + json.dumps(
+                        {"downloads": summary.report["downloads"], "timings": summary.timings},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+                evidence.log(
                     "run report: " + json.dumps(run_report, sort_keys=True, separators=(",", ":"))
                 )
-                run_log.write(f"run finished: {summary.outcome}")
+                evidence.log(f"run finished: {summary.outcome}")
             except BaseException as error:
                 if isinstance(error, LockOwnershipLost) and not isinstance(
                     error, MaximumRunTimeExceeded
@@ -288,7 +281,25 @@ class PipelineDriver:
                     started_monotonic=started_monotonic,
                     finished_at=_aware_utc(self.clock()),
                 )
-                _try_log(run_log, f"run failed: {_error_reason(error)}")
+                failed_report = _run_report(None, progress)
+                _record_source_performance(failed_report, self.source, progress)
+                summary = replace(
+                    summary,
+                    timings={
+                        **summary.timings,
+                        **_performance_timings(progress, self.source),
+                    },
+                    report=failed_report.value,
+                )
+                evidence.try_log(
+                    "performance report: "
+                    + json.dumps(
+                        {"downloads": summary.report["downloads"], "timings": summary.timings},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+                evidence.try_log(f"run failed: {_error_reason(error)}")
 
             assert summary is not None
             ownership_check = (
@@ -298,17 +309,14 @@ class PipelineDriver:
             )
             try:
                 ownership_check()
-                status = build_status(
-                    self.data_root,
+                evidence.finish(
                     store,
                     summary,
                     now=_aware_utc(self.clock()),
                     considered_days=healing_days(now, heal_days, source_epoch=self.source_epoch),
                     source_epoch=self.source_epoch,
+                    ownership_check=ownership_check,
                 )
-                _write_status(self.data_root, status, ownership_check)
-                _append_run(self.data_root, summary.to_dict(), ownership_check)
-                _prune_logs(self.data_root, self.clock(), ownership_check)
             except LockOwnershipLost:
                 if pending_error is not None:
                     raise pending_error.with_traceback(pending_traceback)
@@ -328,11 +336,12 @@ class PipelineDriver:
         report: Callable[[str], None],
         report_error: Callable[[str], None],
         checkpoint: Callable[..., None],
-    ) -> dict[str, Any]:
-        result = _empty_report(window, progress)
+    ) -> RunReportValue:
+        result = _run_report(window, progress)
+        _record_source_performance(result, self.source, progress)
         if window is None:
             report("publication skipped: no Complete Source Day available for Analysis Window")
-            return result
+            return result.value
         builder = SnapshotBuilder(
             self.data_root,
             store=store,
@@ -340,43 +349,66 @@ class PipelineDriver:
             memory_limit=self.duckdb_memory_limit,
             threads=self.duckdb_threads,
         )
+        fact_stats_started = time.monotonic()
         try:
             facts = builder.fact_stats(window)
         except Exception as error:
             report_error(f"fact report failed: {_error_reason(error)}")
         else:
-            result["facts"] = _fact_report(facts)
+            result.record_facts(facts)
+        finally:
+            progress.product_timings["fact_stats_seconds"] = round(
+                max(time.monotonic() - fact_stats_started, 0.0), 6
+            )
         publisher = LatestPublisher(self.object_store) if self.object_store is not None else None
         for product in ("heroes", "builds"):
+            product_started: float | None = None
             try:
                 checkpoint("build", None, step=product)
                 report(f"{product} snapshot build started")
                 self.publication_fault_injector(product, "before_build")
+                product_started = time.monotonic()
                 built = (
                     builder.build_heroes(window)
                     if product == "heroes"
                     else builder.build_builds(window)
                 )
+                progress.product_timings[f"{product}_build_seconds"] = round(
+                    max(time.monotonic() - product_started, 0.0), 6
+                )
                 self.publication_fault_injector(product, "after_build")
                 lock.assert_owned()
+                save_started = time.monotonic()
                 _write_local_snapshot(self.data_root, built, lock.assert_owned)
-                _merge_product_stats(result, built.stats)
+                progress.product_timings[f"{product}_local_save_seconds"] = round(
+                    max(time.monotonic() - save_started, 0.0), 6
+                )
+                result.record_product(built.stats)
                 report(f"{product} snapshot build done")
                 if publish and publisher is not None:
                     checkpoint("publish", None, step=product)
                     self.publication_fault_injector(product, "before_publish")
+                    publish_started = time.monotonic()
                     replaced = publisher.replace(built)
-                    result[product]["published"] = True
+                    progress.product_timings[f"{product}_publish_seconds"] = round(
+                        max(time.monotonic() - publish_started, 0.0), 6
+                    )
+                    result.mark_published(product)
                     report(f"{product} snapshot publication done: replaced={str(replaced).lower()}")
                 elif not publish:
                     report(f"{product} snapshot publication skipped: --no-publish")
                 else:
                     report(f"{product} snapshot publication skipped: no object store")
             except Exception as error:
+                if product_started is not None:
+                    progress.product_timings.setdefault(
+                        f"{product}_build_seconds",
+                        round(max(time.monotonic() - product_started, 0.0), 6),
+                    )
                 failure = {"scope": product, "reason": _error_reason(error)}
                 progress.failures.append(failure)
                 report_error(f"{product} snapshot failed: {failure['reason']}")
-        return result
+        return result.value
 
     def _heal(
         self,
@@ -395,6 +427,7 @@ class PipelineDriver:
     ) -> RunSummary:
         heal_started = time.monotonic()
         progress.heal_started_monotonic = heal_started
+        intake = SourceHourIntake(self.source, store)
         days = healing_days(now, heal_days, source_epoch=self.source_epoch)
         planned_by_day: dict[date, tuple[datetime, ...]] = {}
         for day in days:
@@ -428,53 +461,56 @@ class PipelineDriver:
                     )
                     checkpoint("heal", hour_key, step="index")
                     index_started = time.monotonic()
-                    index = self.source.hour_index(hour)
-                    progress.expected_bundles += len(index.items)
-                    report(
-                        f"hour indexed: source_hour={hour_key} bundles={len(index.items)} "
-                        f"pages={index.pages} "
-                        f"elapsed={_format_elapsed(time.monotonic() - index_started)}"
-                    )
-                    checkpoint(
-                        "heal",
-                        hour_key,
-                        step="ingest",
-                        bundles_done=0,
-                        bundles_total=len(index.items),
-                    )
-                    ingest_started = time.monotonic()
+                    indexed_total = 0
+                    ingest_started = index_started
+                    index_completed = False
 
-                    def observed_bundles():
-                        for completed, bundle in enumerate(self.source.stream(index), start=1):
-                            if not isinstance(bundle, Bundle):
-                                raise TypeError("Source stream must yield Bundle values")
-                            if bundle.validation_error is not None:
-                                progress.failed_bundles += 1
-                                raise RetryableSourceError(
-                                    "bundle_validation_failed",
-                                    f"Bundle validation failed: {bundle.validation_error}",
-                                )
-                            progress.succeeded_bundles += 1
-                            yield bundle
-                            if (
-                                completed == 1
-                                or completed == len(index.items)
-                                or completed % BUNDLE_PROGRESS_EVERY == 0
-                            ):
-                                report(
-                                    f"hour ingest progress: source_hour={hour_key} "
-                                    f"bundles={completed}/{len(index.items)} "
-                                    f"elapsed={_format_elapsed(time.monotonic() - ingest_started)}"
-                                )
-                                checkpoint(
-                                    "heal",
-                                    hour_key,
-                                    step="ingest",
-                                    bundles_done=completed,
-                                    bundles_total=len(index.items),
-                                )
+                    def indexed(bundle_count: int, pages: int) -> None:
+                        nonlocal indexed_total, ingest_started, index_completed
+                        indexed_total = bundle_count
+                        index_completed = True
+                        progress.expected_bundles += bundle_count
+                        progress.listing_pages += pages
+                        progress.source_index_seconds += time.monotonic() - index_started
+                        report(
+                            f"hour indexed: source_hour={hour_key} bundles={bundle_count} "
+                            f"pages={pages} "
+                            f"elapsed={_format_elapsed(time.monotonic() - index_started)}"
+                        )
+                        checkpoint(
+                            "heal",
+                            hour_key,
+                            step="ingest",
+                            bundles_done=0,
+                            bundles_total=bundle_count,
+                        )
+                        ingest_started = time.monotonic()
 
-                    commit = store.commit_hour(project_hour(index, observed_bundles()))
+                    def admitted(completed: int, total: int) -> None:
+                        progress.succeeded_bundles += 1
+                        if (
+                            completed == 1
+                            or completed == total
+                            or completed % BUNDLE_PROGRESS_EVERY == 0
+                        ):
+                            report(
+                                f"hour ingest progress: source_hour={hour_key} "
+                                f"bundles={completed}/{total} "
+                                f"elapsed={_format_elapsed(time.monotonic() - ingest_started)}"
+                            )
+                            checkpoint(
+                                "heal",
+                                hour_key,
+                                step="ingest",
+                                bundles_done=completed,
+                                bundles_total=total,
+                            )
+
+                    commit = intake.commit(hour, on_indexed=indexed, on_bundle=admitted)
+                    progress.source_ingest_seconds += time.monotonic() - ingest_started
+                    progress.batch_generation_seconds += commit.batch_generation_seconds
+                    progress.parquet_write_seconds += commit.parquet_write_seconds
+                    progress.fact_finalize_seconds += commit.fact_finalize_seconds
                     progress.hours_ingested += 1
                     progress.changed = True
                     checkpoint(
@@ -482,7 +518,7 @@ class PipelineDriver:
                         commit.source_hour,
                         step="complete",
                         bundles_done=commit.bundle_count,
-                        bundles_total=len(index.items),
+                        bundles_total=indexed_total,
                     )
                     reused = " reused" if commit.reused else ""
                     report(
@@ -493,10 +529,18 @@ class PipelineDriver:
                         f"{reused} [{progress.hours_ingested}/{progress.hours_planned}]"
                     )
                 except HourExpired as error:
+                    if not index_completed:
+                        progress.source_index_seconds += time.monotonic() - index_started
+                    else:
+                        progress.source_ingest_seconds += time.monotonic() - ingest_started
                     expired_reason = error.reason
                     report_error(f"source hour expired: {hour_key} ({error.reason})")
                     break
                 except RetryableSourceError as error:
+                    if not index_completed:
+                        progress.source_index_seconds += time.monotonic() - index_started
+                    else:
+                        progress.source_ingest_seconds += time.monotonic() - ingest_started
                     expected = progress.expected_bundles - expected_before
                     succeeded = progress.succeeded_bundles - succeeded_before
                     failed = progress.failed_bundles - failed_before
@@ -556,203 +600,76 @@ class PipelineDriver:
             days_sealed=progress.days_sealed,
             days_abandoned=progress.days_abandoned,
             failures=tuple(progress.failures),
-            report=_empty_report(None, progress),
+            report=_run_report(None, progress).value,
             elapsed=time.monotonic() - started_monotonic,
             heal_seconds=time.monotonic() - heal_started,
         )
 
 
-def healing_days(
-    now: datetime, count: int, *, source_epoch: date | str | None = None
-) -> tuple[date, ...]:
-    """Return the oldest-first UTC Source Days considered by an invocation."""
-    current = _aware_utc(now).date()
-    first = current - timedelta(days=count - 1)
-    epoch = parse_source_day(source_epoch) if source_epoch is not None else None
-    return tuple(
-        day
-        for offset in range(count)
-        if (day := first + timedelta(days=offset)) >= (epoch or first)
+def _run_report(window: AnalysisWindow | None, progress: _RunProgress) -> RunReport:
+    return RunReport.empty(
+        window,
+        expected_bundles=progress.expected_bundles,
+        succeeded_bundles=progress.succeeded_bundles,
+        failed_bundles=progress.failed_bundles,
     )
 
 
-def is_hour_settled(
-    source_hour: datetime,
-    now: datetime,
-    *,
-    settle_lag: timedelta = DEFAULT_SETTLE_LAG,
-) -> bool:
-    hour = _aware_utc(source_hour)
-    if hour.minute or hour.second or hour.microsecond:
-        raise ValueError("Source Hour must align to the hour")
-    return _aware_utc(now) >= hour + timedelta(hours=1) + settle_lag
-
-
-def settled_missing_hours(
-    source_day: date,
-    now: datetime,
-    missing: tuple[datetime, ...],
-    *,
-    settle_lag: timedelta = DEFAULT_SETTLE_LAG,
-) -> tuple[datetime, ...]:
-    if any(hour.date() != source_day for hour in missing):
-        raise ValueError("Missing Source Hours must belong to the Source Day")
-    return tuple(
-        sorted(hour for hour in missing if is_hour_settled(hour, now, settle_lag=settle_lag))
-    )
-
-
-def build_status(
-    data_root: str | Path,
-    store: FactStore,
-    last_run: RunSummary | None,
-    *,
-    now: datetime,
-    considered_days: tuple[date, ...] | None = None,
-    source_epoch: date | str | None = None,
-) -> dict[str, Any]:
-    root = Path(data_root)
-    epoch = parse_source_day(source_epoch) if source_epoch is not None else None
-    seals = tuple(
-        item
-        for item in store.seals()
-        if epoch is None or parse_source_day(item.source_day) >= epoch
-    )
-    abandoned = tuple(
-        item
-        for item in store.abandoned_days()
-        if epoch is None or parse_source_day(item.source_day) >= epoch
-    )
-    if considered_days is None:
-        candidate_days = {date.fromisoformat(value[:10]) for value in store.committed_hours()}
-        candidate_days.update(date.fromisoformat(item.source_day) for item in abandoned)
-        considered_days = tuple(
-            sorted(day for day in candidate_days if epoch is None or day >= epoch)
+def _record_source_performance(report: RunReport, source: Source, progress: _RunProgress) -> None:
+    snapshot = getattr(source, "performance_snapshot", None)
+    if not callable(snapshot):
+        report.record_downloads(
+            listing_pages=progress.listing_pages,
+            listing_requests=0,
+            listing_retries=0,
+            download_attempts=0,
+            download_retries=0,
+            downloaded_bytes=0,
+            download_latency_ms_p50=None,
+            download_latency_ms_p95=None,
         )
-    elif epoch is not None:
-        considered_days = tuple(day for day in considered_days if day >= epoch)
-    sealed_days = {item.source_day for item in seals}
-    abandoned_days = {item.source_day for item in abandoned}
-    incomplete = []
-    for day in considered_days:
-        if day.isoformat() in sealed_days or day.isoformat() in abandoned_days:
-            continue
-        missing = store.missing_hours(day)
-        if missing:
-            incomplete.append(
-                {
-                    "source_day": day.isoformat(),
-                    "missing_hours": [hour.strftime("%Y-%m-%dT%H") for hour in missing],
-                    "settled": is_hour_settled(
-                        datetime.combine(day, datetime.min.time(), UTC) + timedelta(hours=23),
-                        now,
-                    ),
-                }
-            )
-    return {
-        "facts": {
-            "newest_sealed_day": max(sealed_days, default=None),
-            "sealed_days": sorted(sealed_days),
-            "incomplete_days": incomplete,
-            "abandoned_days": [
-                {
-                    "source_day": item.source_day,
-                    "missing_hours": list(item.missing_hours),
-                    "reason": item.reason,
-                    "abandoned_at": item.abandoned_at,
-                }
-                for item in abandoned
-            ],
-        },
-        "publication": {
-            product: _local_snapshot_status(root, product) for product in ("heroes", "builds")
-        },
-        "last_run": last_run.to_dict() if last_run is not None else None,
-        "current_run": None,
-        "disk": {"free_bytes": shutil.disk_usage(_existing_ancestor(root)).free},
-        "peak_rss_bytes": peak_rss_bytes(),
+        return
+    performance = snapshot()
+    report.record_downloads(
+        listing_pages=progress.listing_pages,
+        listing_requests=performance.listing_requests,
+        listing_retries=performance.listing_retries,
+        download_attempts=performance.download_attempts,
+        download_retries=performance.download_retries,
+        downloaded_bytes=performance.downloaded_bytes,
+        download_latency_ms_p50=performance.download_latency_ms_p50,
+        download_latency_ms_p95=performance.download_latency_ms_p95,
+    )
+
+
+def _reset_source_performance(source: Source) -> None:
+    snapshot = getattr(source, "performance_snapshot", None)
+    if callable(snapshot):
+        snapshot(reset=True)
+
+
+def _performance_timings(progress: _RunProgress, source: Source) -> dict[str, float]:
+    download_wait_seconds = 0.0
+    retry_sleep_seconds = 0.0
+    snapshot = getattr(source, "performance_snapshot", None)
+    if callable(snapshot):
+        performance = snapshot()
+        download_wait_seconds = performance.download_wait_seconds
+        retry_sleep_seconds = performance.retry_sleep_seconds
+    value = {
+        "source_index_seconds": round(max(progress.source_index_seconds, 0.0), 6),
+        "source_ingest_seconds": round(max(progress.source_ingest_seconds, 0.0), 6),
+        "batch_generation_seconds": round(max(progress.batch_generation_seconds, 0.0), 6),
+        "projection_seconds": round(
+            max(progress.batch_generation_seconds - download_wait_seconds, 0.0), 6
+        ),
+        "parquet_write_seconds": round(max(progress.parquet_write_seconds, 0.0), 6),
+        "fact_finalize_seconds": round(max(progress.fact_finalize_seconds, 0.0), 6),
+        "download_wait_seconds": download_wait_seconds,
+        "retry_sleep_seconds": retry_sleep_seconds,
+        **progress.product_timings,
     }
-
-
-def read_status(data_root: str | Path, *, source_epoch: date | str | None = None) -> dict[str, Any]:
-    path = Path(data_root) / "status.json"
-    try:
-        value = json.loads(path.read_bytes())
-    except FileNotFoundError:
-        return build_status(
-            data_root,
-            FactStore(data_root),
-            None,
-            now=datetime.now(UTC),
-            source_epoch=source_epoch,
-        )
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
-        raise RuntimeError("status.json is unreadable") from error
-    if not isinstance(value, dict):
-        raise RuntimeError("status.json must contain an object")
     return value
-
-
-def peak_rss_bytes() -> int:
-    observed = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-    return observed if sys.platform == "darwin" else observed * 1024
-
-
-def _empty_report(window: AnalysisWindow | None, progress: _RunProgress) -> dict[str, Any]:
-    return {
-        "window": window.value if window is not None else None,
-        "downloads": {
-            "expected_bundles": progress.expected_bundles,
-            "succeeded_bundles": progress.succeeded_bundles,
-            "failed_bundles": progress.failed_bundles,
-        },
-        "facts": {
-            "raw_runs": 0,
-            "discarded_unknown_hero": 0,
-            "discarded_unknown_final_rank": 0,
-            "included_runs": 0,
-            "included_battles": 0,
-        },
-        "heroes": {
-            "participating_runs": 0,
-            "participating_matchup_battles": 0,
-            "published": False,
-        },
-        "builds": {
-            "eligible_layout_runs": 0,
-            "candidate_builds": 0,
-            "published_builds": 0,
-            "published": False,
-        },
-    }
-
-
-def _fact_report(stats: FactStats) -> dict[str, int]:
-    return {
-        "raw_runs": stats.raw_runs,
-        "discarded_unknown_hero": stats.discarded_unknown_hero,
-        "discarded_unknown_final_rank": stats.discarded_unknown_final_rank,
-        "included_runs": stats.included_runs,
-        "included_battles": stats.included_battles,
-    }
-
-
-def _merge_product_stats(report: dict[str, Any], stats: HeroStats | BuildStats) -> None:
-    if isinstance(stats, HeroStats):
-        report["heroes"].update(
-            {
-                "participating_runs": stats.participating_runs,
-                "participating_matchup_battles": stats.participating_matchup_battles,
-            }
-        )
-    else:
-        report["builds"].update(
-            {
-                "eligible_layout_runs": stats.eligible_layout_runs,
-                "candidate_builds": stats.candidate_builds,
-                "published_builds": stats.published_builds,
-            }
-        )
 
 
 def _write_local_snapshot(
@@ -776,66 +693,6 @@ def _write_local_snapshot(
         if descriptor >= 0:
             os.close(descriptor)
         temporary.unlink(missing_ok=True)
-
-
-def _local_snapshot_status(root: Path, product: str) -> dict[str, object]:
-    path = root / "snapshots" / product / "latest.json"
-    try:
-        payload = json.loads(path.read_bytes())
-        window_end = payload["window"]["end"]
-    except FileNotFoundError, OSError, KeyError, TypeError, json.JSONDecodeError:
-        return {"present": False, "window_end": None}
-    return {"present": True, "window_end": window_end}
-
-
-def _write_current_status(
-    root: Path,
-    store: FactStore,
-    *,
-    run_id: str,
-    phase: str,
-    step: str,
-    current_hour: str | None,
-    hours_done: int,
-    hours_planned: int,
-    bundles_done: int | None,
-    bundles_total: int | None,
-    started_at: datetime,
-    now: datetime,
-    considered_days: tuple[date, ...],
-    source_epoch: date | None,
-    ownership_check: Callable[[], None],
-) -> None:
-    previous: dict[str, Any] = {}
-    try:
-        observed = json.loads((root / "status.json").read_bytes())
-        if isinstance(observed, dict):
-            previous = observed
-    except FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError:
-        pass
-    status = build_status(
-        root,
-        store,
-        None,
-        now=now,
-        considered_days=considered_days,
-        source_epoch=source_epoch,
-    )
-    status["last_run"] = previous.get("last_run")
-    current_run: dict[str, Any] = {
-        "run_id": run_id,
-        "phase": phase,
-        "step": step,
-        "current_hour": current_hour,
-        "hours_done": hours_done,
-        "hours_planned": hours_planned,
-        "started_at": _timestamp(started_at),
-        "updated_at": _timestamp(now),
-    }
-    if bundles_total is not None:
-        current_run["bundles"] = {"done": bundles_done or 0, "total": bundles_total}
-    status["current_run"] = current_run
-    _write_status(root, status, ownership_check)
 
 
 def _failed_summary(
@@ -866,7 +723,7 @@ def _failed_summary(
             days_sealed=progress.days_sealed,
             days_abandoned=progress.days_abandoned,
             failures=failures,
-            report=_empty_report(None, progress),
+            report=_run_report(None, progress).value,
             elapsed=time.monotonic() - started_monotonic,
             heal_seconds=heal_seconds,
         )
@@ -880,7 +737,7 @@ def _failed_summary(
         outcome="error",
         exit_code=1,
         failures=failures,
-        report=_empty_report(None, progress),
+        report=_run_report(None, progress).value,
         peak_rss_bytes=peak_rss_bytes(),
     )
 
@@ -896,7 +753,7 @@ def _summary(
     days_sealed: int,
     days_abandoned: int,
     failures: tuple[dict[str, str], ...],
-    report: dict[str, Any],
+    report: RunReportValue,
     elapsed: float,
     heal_seconds: float = 0.0,
 ) -> RunSummary:
@@ -926,50 +783,6 @@ def _error_reason(error: BaseException) -> str:
     return str(error) or type(error).__name__
 
 
-def _try_log(run_log: "_RunLog | None", message: str) -> None:
-    if run_log is None:
-        return
-    try:
-        run_log.write(message)
-    except BaseException:
-        pass
-
-
-def _write_status(root: Path, value: dict[str, Any], ownership_check: Callable[[], None]) -> None:
-    ownership_check()
-    root.mkdir(parents=True, exist_ok=True)
-    descriptor, name = tempfile.mkstemp(prefix=".status.json.tmp-", dir=root)
-    temporary = Path(name)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            descriptor = -1
-            stream.write(_canonical_json(value))
-            stream.flush()
-            os.fsync(stream.fileno())
-        ownership_check()
-        os.replace(temporary, root / "status.json")
-        _fsync_directory(root)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        temporary.unlink(missing_ok=True)
-
-
-def _append_run(root: Path, value: dict[str, Any], ownership_check: Callable[[], None]) -> None:
-    ownership_check()
-    root.mkdir(parents=True, exist_ok=True)
-    with (root / "runs.jsonl").open("ab") as stream:
-        stream.write(_canonical_json(value))
-        stream.flush()
-        os.fsync(stream.fileno())
-
-
-def _canonical_json(value: object) -> bytes:
-    return (
-        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
-    ).encode("utf-8")
-
-
 def _timestamp(value: datetime) -> str:
     return _aware_utc(value).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -988,60 +801,9 @@ def _format_elapsed(value: float) -> str:
     return f"{max(round(value), 0)}s"
 
 
-def _existing_ancestor(path: Path) -> Path:
-    candidate = path
-    while not candidate.exists():
-        if candidate.parent == candidate:
-            return Path("/")
-        candidate = candidate.parent
-    return candidate
-
-
 def _fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-
-
-class _RunLog:
-    def __init__(
-        self,
-        root: Path,
-        run_id: str,
-        *,
-        clock: Callable[[], datetime],
-        ownership_check: Callable[[], None],
-    ) -> None:
-        self._clock = clock
-        self._ownership_check = ownership_check
-        directory = root / "logs"
-        ownership_check()
-        directory.mkdir(parents=True, exist_ok=True)
-        stamp = _aware_utc(clock()).strftime("%Y%m%dT%H%M%S.%fZ")
-        self._path = directory / f"{stamp}-{os.getpid()}-{run_id[:8]}.log"
-
-    def write(self, message: str) -> None:
-        self._ownership_check()
-        with self._path.open("a", encoding="utf-8") as stream:
-            stream.write(f"{_timestamp(self._clock())} {message}\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-
-
-def _prune_logs(root: Path, now: datetime, ownership_check: Callable[[], None]) -> None:
-    cutoff = _aware_utc(now).timestamp() - 10 * 24 * 60 * 60
-    directory = root / "logs"
-    if not directory.is_dir():
-        return
-    for path in directory.iterdir():
-        if not path.is_file() or path.suffix != ".log":
-            continue
-        try:
-            expired = path.stat().st_mtime < cutoff
-        except OSError:
-            continue
-        if expired:
-            ownership_check()
-            path.unlink(missing_ok=True)

@@ -5,10 +5,11 @@ import httpx
 import pytest
 
 from bppanalyzer.bundle_source import (
-    Bundle,
     BundleRef,
     BundleSource,
     RawHourIndex,
+    RetryableSourceError,
+    admit_bundle,
     raw_commit_sha256,
 )
 from bppanalyzer.projection import project_hour
@@ -33,7 +34,7 @@ def _project_payload(run_payload: bytes):
     )
     return project_hour(
         index,
-        [Bundle(ref, content, hashlib.sha256(content).hexdigest(), len(content))],
+        [admit_bundle(ref, content)],
     )
 
 
@@ -116,9 +117,7 @@ def test_battle_outcome_keeps_an_unknown_combatant_undecided() -> None:
     assert run["battle_decided_count"] == 0
 
 
-def test_bundle_digest_magic_and_segment_failures_are_quarantined_without_dropping_valid_data() -> (
-    None
-):
+def test_bundle_admission_failure_stops_the_source_hour_before_commit() -> None:
     valid = bundle_bytes("bundle-a")
     wrong_declared_digest = bundle_bytes("bundle-b")
     corrupt_magic = b"NOTBNDL5" + bundle_bytes("bundle-c")[8:]
@@ -169,21 +168,10 @@ def test_bundle_digest_magic_and_segment_failures_are_quarantined_without_droppi
     )
 
     index = source.hour_index(SOURCE_HOUR)
-    projected = project_hour(index, source.stream(index))
+    with pytest.raises(RetryableSourceError) as raised:
+        project_hour(index, source.stream(index)).tables
 
-    assert projected.tables["runs"].num_rows == 1
-    quarantine = projected.tables["quarantine"].to_pylist()
-    assert [row["bundle_id"] for row in quarantine] == [
-        "bundle-b",
-        "bundle-c",
-        "bundle-d",
-    ]
-    assert [row["reason_code"] for row in quarantine] == [
-        "bundle_sha256_mismatch",
-        "invalid_prefix",
-        "segment_digest_mismatch",
-    ]
-    assert sum(table.num_rows for table in projected.tables.values()) >= 4
+    assert raised.value.reason == "bundle_validation_failed"
 
 
 def test_client_timestamp_anomalies_are_quality_rows_and_never_repartition_a_bundle() -> None:
@@ -212,7 +200,7 @@ def test_client_timestamp_anomalies_are_quality_rows_and_never_repartition_a_bun
 
     projected = project_hour(
         index,
-        [Bundle(ref, content, hashlib.sha256(content).hexdigest(), len(content))],
+        [admit_bundle(ref, content)],
     )
 
     quality_codes = {row["code"] for row in projected.tables["quality"].to_pylist()}

@@ -7,15 +7,18 @@ semantics belong to `specs/consumer-data-contract.md`.
 
 One directory-locked invocation:
 
-1. heals settled Source Hours by streaming verified Bundles into hourly facts;
+1. heals settled Source Hours through one intake transaction: enumerate the
+   complete index, admit each Bundle once, project bounded Arrow batches, and
+   atomically commit the complete hour;
 2. seals a Complete Source Day only after all 24 hourly commits verify;
 3. selects the latest consecutive one-to-seven-day Analysis Window;
 4. builds, validates, saves, and optionally publishes each consumer snapshot
    independently.
 
-Raw Bundle bytes are streamed and discarded. Durable local state consists of
-hourly facts and commits, day seals or abandonment records, current snapshots,
-status, run history, and logs.
+Raw Bundle envelopes are validated once at admission; only the manifest and Run
+segment cross into projection. Raw bytes are then discarded. Durable local
+state consists of hourly facts and commits, day seals or abandonment records,
+current snapshots, status, run history, and logs.
 
 ## Recovery invariants
 
@@ -38,6 +41,12 @@ status, run history, and logs.
 external state. `run --no-publish` performs collection and local snapshot
 replacement without constructing an R2 adapter.
 
-Each normal invocation atomically refreshes `status.json`, appends a structured
-Run Report to `runs.jsonl`, and records progress in its run log. These artifacts
-are local operational evidence, not consumer objects.
+The Operational Evidence module owns the shape and persistence of the Run
+Report, live status, run history, and logs. Each normal invocation atomically
+refreshes `status.json`, appends to `runs.jsonl`, and records progress in its run
+log. These artifacts are local operational evidence, not consumer objects.
+
+Run evidence aggregates collection and processing performance at Run scope:
+listing pages and retries, download attempts, retries, bytes and latency
+percentiles, plus bounded stage timings for projection, Parquet persistence,
+snapshot construction, and publication. It never stores per-Bundle metrics.
