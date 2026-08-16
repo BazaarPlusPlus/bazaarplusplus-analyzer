@@ -6,6 +6,10 @@ writes. They are workload observations, not portable guarantees.
 
 ## Bundle retention behavior
 
+The configured retention contract is eight days. Deterministic boundary checks
+cover the Worker cutoff (`8 × 86,400,000 ms`) and the Analyzer default (eight
+UTC dates).
+
 The server returns HTTP 410 with `window_expired` for hours outside retention
 and HTTP 200 with an empty `items` array for a retained hour with no Bundles.
 The source adapter preserves this distinction; an expired day is abandoned,
