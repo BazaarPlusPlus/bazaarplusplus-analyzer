@@ -21,7 +21,9 @@ A busy Source Hour contains roughly 2,400 Bundles. Initial conservative
 collection took five to six minutes per busy hour. Because the workload is
 latency-bound, increasing download concurrency from 4 to 8 approximately
 halved collection time. Concurrency 64 produced no observed server-side
-pushback when the HTTP keepalive pool was sized to match.
+pushback when the HTTP keepalive pool was sized to match. The shipped
+defaults are therefore 64 download workers, 128-bundle lookahead, and a
+21,600-second run budget.
 
 Transient collection failures use bounded jittered backoff. A valid
 `Retry-After` response can extend the next delay up to 60 seconds. Once a fatal

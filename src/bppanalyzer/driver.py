@@ -78,7 +78,7 @@ class PipelineDriver:
         settle_lag: timedelta = DEFAULT_SETTLE_LAG,
         heartbeat_interval: float = 30,
         stale_after: float = 300,
-        max_run_seconds: float = 7200,
+        max_run_seconds: float = 21600,
         duckdb_memory_limit: str = "1GB",
         duckdb_threads: int = 1,
         object_store: ObjectStore | None = None,

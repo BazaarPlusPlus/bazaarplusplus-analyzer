@@ -19,9 +19,9 @@ class Config:
     sync_token: str | None = field(repr=False)
     source_epoch: date | None = None
     bundle_retention_days: int = 8
-    download_concurrency: int = 4
-    download_lookahead: int = 8
-    max_run_seconds: int = 7200
+    download_concurrency: int = 64
+    download_lookahead: int = 128
+    max_run_seconds: int = 21600
     duckdb_memory_limit: str = "8GB"
     duckdb_threads: int = 8
     r2_account_id: str | None = None
@@ -72,13 +72,13 @@ def load_config(
             values.get("BPP_BUNDLE_RETENTION_DAYS"), 8, "BPP_BUNDLE_RETENTION_DAYS"
         ),
         download_concurrency=_positive_int(
-            values.get("BPP_DOWNLOAD_CONCURRENCY"), 4, "BPP_DOWNLOAD_CONCURRENCY"
+            values.get("BPP_DOWNLOAD_CONCURRENCY"), 64, "BPP_DOWNLOAD_CONCURRENCY"
         ),
         download_lookahead=_positive_int(
-            values.get("BPP_DOWNLOAD_LOOKAHEAD"), 8, "BPP_DOWNLOAD_LOOKAHEAD"
+            values.get("BPP_DOWNLOAD_LOOKAHEAD"), 128, "BPP_DOWNLOAD_LOOKAHEAD"
         ),
         max_run_seconds=_positive_int(
-            values.get("BPP_MAX_RUN_SECONDS"), 7200, "BPP_MAX_RUN_SECONDS"
+            values.get("BPP_MAX_RUN_SECONDS"), 21600, "BPP_MAX_RUN_SECONDS"
         ),
         duckdb_memory_limit=_memory_limit(values.get("BPP_DUCKDB_MEMORY_LIMIT")),
         duckdb_threads=_positive_int(values.get("BPP_DUCKDB_THREADS"), 8, "BPP_DUCKDB_THREADS"),

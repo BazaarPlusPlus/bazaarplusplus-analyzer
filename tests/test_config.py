@@ -74,6 +74,9 @@ def test_source_epoch_is_optional_and_parsed_as_a_strict_utc_date(tmp_path: Path
     config = load_config(root=tmp_path)
     assert config.source_epoch is None
     assert config.bundle_retention_days == 8
+    assert config.download_concurrency == 64
+    assert config.download_lookahead == 128
+    assert config.max_run_seconds == 21600
 
     _write_env(tmp_path, "BPP_SOURCE_EPOCH=2026-08-07\n")
     assert load_config(root=tmp_path).source_epoch == date(2026, 8, 7)
