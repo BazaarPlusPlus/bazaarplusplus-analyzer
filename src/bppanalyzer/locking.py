@@ -37,7 +37,7 @@ class DirectoryLock:
         *,
         heartbeat_interval: float = 30,
         stale_after: float = 300,
-        max_run_seconds: float = 7200,
+        max_run_seconds: float = 21600,
         wall_clock: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
