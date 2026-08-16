@@ -18,7 +18,7 @@ class Config:
     api_base_url: str | None
     sync_token: str | None = field(repr=False)
     source_epoch: date | None = None
-    bundle_retention_days: int = 10
+    bundle_retention_days: int = 8
     download_concurrency: int = 4
     download_lookahead: int = 8
     max_run_seconds: int = 7200
@@ -69,7 +69,7 @@ def load_config(
         sync_token=sync_token,
         source_epoch=_source_epoch(values.get("BPP_SOURCE_EPOCH")),
         bundle_retention_days=_positive_int(
-            values.get("BPP_BUNDLE_RETENTION_DAYS"), 10, "BPP_BUNDLE_RETENTION_DAYS"
+            values.get("BPP_BUNDLE_RETENTION_DAYS"), 8, "BPP_BUNDLE_RETENTION_DAYS"
         ),
         download_concurrency=_positive_int(
             values.get("BPP_DOWNLOAD_CONCURRENCY"), 4, "BPP_DOWNLOAD_CONCURRENCY"

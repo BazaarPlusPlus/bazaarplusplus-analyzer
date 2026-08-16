@@ -510,7 +510,7 @@ def test_empty_index_past_retention_is_expired_instead_of_a_zero_row_hour() -> N
         sync_token="test-token",
         client=httpx.Client(transport=httpx.MockTransport(empty)),
         clock=lambda: datetime(2026, 8, 21, tzinfo=UTC),
-        retention_days=10,
+        retention_days=8,
     )
 
     with pytest.raises(HourExpired, match="past retention"):

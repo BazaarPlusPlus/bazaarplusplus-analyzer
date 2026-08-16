@@ -157,7 +157,7 @@ class BundleSource:
         sync_token: str,
         client: httpx.Client | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
-        retention_days: int = 10,
+        retention_days: int = 8,
         download_concurrency: int = 4,
         lookahead: int = 8,
         page_limit: int = 200,
