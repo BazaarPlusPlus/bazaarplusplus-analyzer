@@ -12,7 +12,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypedDict
 
-from bppanalyzer.fact_store import FactStore, parse_source_day
+from bppanalyzer.fact_store import FactPruneReport, FactStore, parse_source_day
 from bppanalyzer.hour_intake import is_hour_settled
 from bppanalyzer.publication import AnalysisWindow, BuildStats, FactStats, HeroStats
 
@@ -58,12 +58,20 @@ class BuildReport(TypedDict):
     published: bool
 
 
+class RetentionReport(TypedDict):
+    source_days_pruned: int
+    hours_pruned: int
+    files_pruned: int
+    bytes_pruned: int
+
+
 class RunReportValue(TypedDict):
     window: WindowReport | None
     downloads: DownloadReport
     facts: FactReport
     heroes: HeroReport
     builds: BuildReport
+    retention: RetentionReport
 
 
 @dataclass(slots=True)
@@ -118,6 +126,12 @@ class RunReport:
                 "candidate_builds": 0,
                 "published_builds": 0,
                 "published": False,
+            },
+            "retention": {
+                "source_days_pruned": 0,
+                "hours_pruned": 0,
+                "files_pruned": 0,
+                "bytes_pruned": 0,
             },
         }
         return cls(value)
@@ -174,6 +188,14 @@ class RunReport:
             self.value["builds"]["published"] = True
         else:
             raise ValueError(f"Unknown consumer product: {product}")
+
+    def record_retention(self, report: FactPruneReport) -> None:
+        self.value["retention"] = {
+            "source_days_pruned": len(report.source_days),
+            "hours_pruned": report.hours_pruned,
+            "files_pruned": report.files_pruned,
+            "bytes_pruned": report.bytes_pruned,
+        }
 
 
 @dataclass(frozen=True, slots=True)

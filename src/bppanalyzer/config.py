@@ -12,6 +12,9 @@ class ConfigurationError(ValueError):
     """Required pipeline configuration is missing or invalid."""
 
 
+MIN_FACT_RETENTION_DAYS = 8
+
+
 @dataclass(frozen=True, slots=True)
 class Config:
     data_root: Path
@@ -19,6 +22,7 @@ class Config:
     sync_token: str | None = field(repr=False)
     source_epoch: date | None = None
     bundle_retention_days: int = 8
+    fact_retention_days: int = MIN_FACT_RETENTION_DAYS
     download_concurrency: int = 64
     download_lookahead: int = 128
     max_run_seconds: int = 21600
@@ -71,6 +75,11 @@ def load_config(
         bundle_retention_days=_positive_int(
             values.get("BPP_BUNDLE_RETENTION_DAYS"), 8, "BPP_BUNDLE_RETENTION_DAYS"
         ),
+        fact_retention_days=_minimum_int(
+            values.get("BPP_FACT_RETENTION_DAYS"),
+            MIN_FACT_RETENTION_DAYS,
+            "BPP_FACT_RETENTION_DAYS",
+        ),
         download_concurrency=_positive_int(
             values.get("BPP_DOWNLOAD_CONCURRENCY"), 64, "BPP_DOWNLOAD_CONCURRENCY"
         ),
@@ -102,6 +111,13 @@ def _positive_int(value: object, default: int, name: str) -> int:
         raise ConfigurationError(f"{name} must be a positive integer") from error
     if parsed < 1:
         raise ConfigurationError(f"{name} must be a positive integer")
+    return parsed
+
+
+def _minimum_int(value: object, minimum: int, name: str) -> int:
+    parsed = _positive_int(value, minimum, name)
+    if parsed < minimum:
+        raise ConfigurationError(f"{name} must be at least {minimum}")
     return parsed
 
 

@@ -68,6 +68,7 @@ def run_command(
                     max_run_seconds=config.max_run_seconds,
                     duckdb_memory_limit=config.duckdb_memory_limit,
                     duckdb_threads=config.duckdb_threads,
+                    fact_retention_days=config.fact_retention_days,
                     object_store=None if no_publish else _object_store(config),
                 ).run(
                     heal_days=heal_days,

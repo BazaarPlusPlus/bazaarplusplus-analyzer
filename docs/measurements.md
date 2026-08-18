@@ -36,6 +36,17 @@ Hour fails without a commit.
 Busy hours produce roughly 17–22 MiB of Parquet, dominated by Battle Cards.
 Five sealed Source Days occupied about 1.9 GiB.
 
+The default local fact retention is the latest eight sealed Complete Source
+Days. It is intentionally separate from the Bundle Server's eight-day source
+availability contract. Retention runs only after both consumer snapshots have
+published successfully and preserves every newer incomplete Source Hour.
+
+On 2026-08-19, 272 hourly partitions spanning 11 sealed days plus eight hours
+of the next Source Day occupied 4,731,857,648 bytes (4.41 GiB). Applying the
+eight-sealed-day boundary to that population would remove 72 old hourly
+partitions totaling about 1.19 GiB, leaving an estimated 3.21 GiB. Daily size
+varies with Bundle volume.
+
 ## Analysis resources
 
 Analysis of five Source Days containing 2.79 million Battles took about four

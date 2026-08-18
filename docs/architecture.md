@@ -13,7 +13,9 @@ One directory-locked invocation:
 2. seals a Complete Source Day only after all 24 hourly commits verify;
 3. selects the latest consecutive one-to-seven-day Analysis Window;
 4. builds, validates, saves, and optionally publishes each consumer snapshot
-   independently.
+   independently;
+5. after both consumer snapshots publish successfully, removes local facts older
+   than the configured number of latest Complete Source Days.
 
 Raw Bundle envelopes are validated once at admission; only the manifest and Run
 segment cross into projection. Raw bytes are then discarded. Durable local
@@ -28,6 +30,11 @@ current snapshots, status, run history, and logs.
 - A day seal names exactly 24 verified hourly commit identities. A retention-
   expired day that cannot be completed is recorded as abandoned.
 - Analysis reads explicit Parquet paths recovered from verified day seals.
+- Fact retention defaults to the latest eight Complete Source Days: the
+  seven-day Analysis Window plus one rollback day. All newer incomplete Source
+  Hours remain available for sealing. Retention removes an expired day seal
+  before its hourly facts, so an interrupted cleanup cannot leave a seal that
+  references missing files.
 - Each product uses its own analysis connection and failure boundary. A valid
   product can advance while the other product remains unchanged.
 - Snapshot bytes are canonical JSON and pass schema plus semantic validation

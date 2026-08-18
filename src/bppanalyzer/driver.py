@@ -14,6 +14,7 @@ from bppanalyzer.bundle_source import (
     HourExpired,
     RetryableSourceError,
 )
+from bppanalyzer.config import MIN_FACT_RETENTION_DAYS
 from bppanalyzer.fact_store import FactStore, parse_source_day
 from bppanalyzer.hour_intake import (
     DEFAULT_SETTLE_LAG,
@@ -81,12 +82,19 @@ class PipelineDriver:
         max_run_seconds: float = 21600,
         duckdb_memory_limit: str = "1GB",
         duckdb_threads: int = 1,
+        fact_retention_days: int = MIN_FACT_RETENTION_DAYS,
         object_store: ObjectStore | None = None,
         fact_fault_injector: Callable[[str, Path], None] | None = None,
         publication_fault_injector: Callable[[str, str], None] | None = None,
     ) -> None:
         if settle_lag <= timedelta():
             raise ValueError("Settle lag must be positive")
+        if (
+            not isinstance(fact_retention_days, int)
+            or isinstance(fact_retention_days, bool)
+            or fact_retention_days < MIN_FACT_RETENTION_DAYS
+        ):
+            raise ValueError(f"fact_retention_days must be at least {MIN_FACT_RETENTION_DAYS}")
         self.data_root = Path(data_root)
         self.source = source
         self.source_epoch = parse_source_day(source_epoch) if source_epoch is not None else None
@@ -97,6 +105,7 @@ class PipelineDriver:
         self.max_run_seconds = max_run_seconds
         self.duckdb_memory_limit = duckdb_memory_limit
         self.duckdb_threads = duckdb_threads
+        self.fact_retention_days = fact_retention_days
         self.object_store = object_store
         self.fact_fault_injector = fact_fault_injector
         self.publication_fault_injector = publication_fault_injector or (
@@ -233,6 +242,15 @@ class PipelineDriver:
                     report_error=report_error,
                     checkpoint=checkpoint,
                 )
+                if run_report["heroes"]["published"] and run_report["builds"]["published"]:
+                    pruned = store.prune(retain_days=self.fact_retention_days)
+                    RunReport(run_report).record_retention(pruned)
+                    report(
+                        "fact retention done: "
+                        f"source_days={len(pruned.source_days)} "
+                        f"hours={pruned.hours_pruned} files={pruned.files_pruned} "
+                        f"bytes={pruned.bytes_pruned}"
+                    )
                 publication_failures = tuple(
                     item for item in progress.failures if item.get("scope") in {"heroes", "builds"}
                 )
