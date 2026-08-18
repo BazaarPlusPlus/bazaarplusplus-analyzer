@@ -84,3 +84,15 @@ def test_source_epoch_is_optional_and_parsed_as_a_strict_utc_date(tmp_path: Path
     _write_env(tmp_path, "BPP_SOURCE_EPOCH=2026-8-7\n")
     with pytest.raises(ConfigurationError, match="BPP_SOURCE_EPOCH.*YYYY-MM-DD"):
         load_config(root=tmp_path)
+
+
+def test_fact_retention_defaults_to_eight_and_rejects_shorter_windows(tmp_path: Path) -> None:
+    _write_env(tmp_path)
+    assert load_config(root=tmp_path).fact_retention_days == 8
+
+    _write_env(tmp_path, "BPP_FACT_RETENTION_DAYS=12\n")
+    assert load_config(root=tmp_path).fact_retention_days == 12
+
+    _write_env(tmp_path, "BPP_FACT_RETENTION_DAYS=7\n")
+    with pytest.raises(ConfigurationError, match="BPP_FACT_RETENTION_DAYS must be at least 8"):
+        load_config(root=tmp_path)

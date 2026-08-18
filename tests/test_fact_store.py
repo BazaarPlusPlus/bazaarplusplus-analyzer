@@ -95,3 +95,29 @@ def test_verify_rehashes_parquet_and_hour_paths_expose_only_a_sealed_window(
 
     with pytest.raises(FactCorrupt, match="checksum differs"):
         store.verify("2026-08-10")
+
+
+def test_prune_keeps_eight_latest_sealed_days_and_newer_partial_hours(tmp_path: Path) -> None:
+    from tests.release_fixtures import sealed_store
+
+    store = sealed_store(tmp_path, 9)
+    partial = datetime(2026, 8, 16, 0, tzinfo=UTC)
+    store.commit_hour(_empty_hour(partial))
+
+    report = store.prune(retain_days=8)
+
+    assert report.source_days == ("2026-08-07",)
+    assert report.hours_pruned == 24
+    assert [seal.source_day for seal in store.seals()] == [
+        "2026-08-08",
+        "2026-08-09",
+        "2026-08-10",
+        "2026-08-11",
+        "2026-08-12",
+        "2026-08-13",
+        "2026-08-14",
+        "2026-08-15",
+    ]
+    assert store.committed_hours()[0] == "2026-08-08T00"
+    assert store.committed_hours()[-1] == "2026-08-16T00"
+    assert store.verify().hours_verified == 8 * 24

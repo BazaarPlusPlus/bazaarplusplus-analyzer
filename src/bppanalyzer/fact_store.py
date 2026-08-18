@@ -87,6 +87,14 @@ class VerifyReport:
     deep: bool
 
 
+@dataclass(frozen=True, slots=True)
+class FactPruneReport:
+    source_days: tuple[str, ...]
+    hours_pruned: int
+    files_pruned: int
+    bytes_pruned: int
+
+
 class FactStore:
     """The only owner of paths beneath ``facts/``."""
 
@@ -413,6 +421,58 @@ class FactStore:
             self._read_hour(parse_source_hour(match.group(1)), deep=False)
             result.append(match.group(1))
         return tuple(result)
+
+    def prune(self, *, retain_days: int) -> FactPruneReport:
+        """Remove facts older than the latest retained Complete Source Days."""
+        if not isinstance(retain_days, int) or isinstance(retain_days, bool) or retain_days < 1:
+            raise ValueError("retain_days must be a positive integer")
+        seals = self.seals()
+        if len(seals) < retain_days:
+            return FactPruneReport((), 0, 0, 0)
+
+        cutoff = parse_source_day(seals[-retain_days].source_day)
+        pruned_days: set[str] = set()
+        files_pruned = 0
+        bytes_pruned = 0
+
+        for seal in seals[:-retain_days]:
+            path = self._seal_path(parse_source_day(seal.source_day))
+            self._ownership_check()
+            try:
+                bytes_pruned += path.stat().st_size
+            except OSError:
+                pass
+            path.unlink()
+            files_pruned += 1
+            pruned_days.add(seal.source_day)
+        if seals[:-retain_days]:
+            _fsync_directory(self._sealed)
+
+        hours_pruned = 0
+        if self._hourly.is_dir():
+            for path in sorted(self._hourly.iterdir()):
+                match = _HOUR_DIR.fullmatch(path.name)
+                if match is None or not path.is_dir():
+                    continue
+                source_hour = parse_source_hour(match.group(1))
+                if source_hour.date() >= cutoff:
+                    continue
+                self._ownership_check()
+                for item in path.iterdir():
+                    if not item.is_file():
+                        continue
+                    try:
+                        bytes_pruned += item.stat().st_size
+                    except OSError:
+                        pass
+                    files_pruned += 1
+                shutil.rmtree(path)
+                hours_pruned += 1
+                pruned_days.add(source_hour.date().isoformat())
+            if hours_pruned:
+                _fsync_directory(self._hourly)
+
+        return FactPruneReport(tuple(sorted(pruned_days)), hours_pruned, files_pruned, bytes_pruned)
 
     def _read_hour(self, source_hour: datetime | str, *, deep: bool) -> HourCommit:
         hour = parse_source_hour(source_hour)

@@ -15,6 +15,7 @@ from bppanalyzer.bundle_source import (
     raw_commit_sha256,
 )
 from bppanalyzer.driver import PipelineDriver
+from bppanalyzer.fact_store import FactStore
 from bppanalyzer.object_store import LocalObjectStore
 from bppanalyzer.operational_evidence import read_status
 from bppanalyzer.publication import BUILDS_KEY, HEROES_KEY
@@ -100,6 +101,63 @@ def test_one_complete_day_publishes_a_one_day_window(tmp_path: Path) -> None:
     ]
 
 
+def test_successful_publication_prunes_facts_to_eight_latest_sealed_days(
+    tmp_path: Path,
+) -> None:
+    from tests.release_fixtures import sealed_store
+
+    root = tmp_path / "facts"
+    sealed_store(root, 9)
+    objects = LocalObjectStore(tmp_path / "objects")
+
+    summary = PipelineDriver(
+        root,
+        source=NeverSource(),
+        clock=lambda: datetime(2026, 8, 15, 23, 59, tzinfo=UTC),
+        object_store=objects,
+    ).run(heal_days=9)
+
+    assert summary.exit_code == 0
+    assert summary.report["window"] == {
+        "start": "2026-08-09",
+        "end": "2026-08-15",
+        "days": 7,
+    }
+    assert summary.report["retention"]["source_days_pruned"] == 1
+    assert summary.report["retention"]["hours_pruned"] == 24
+    assert summary.report["retention"]["files_pruned"] == 145
+    assert summary.report["retention"]["bytes_pruned"] > 0
+    assert [seal.source_day for seal in FactStore(root).seals()] == [
+        "2026-08-08",
+        "2026-08-09",
+        "2026-08-10",
+        "2026-08-11",
+        "2026-08-12",
+        "2026-08-13",
+        "2026-08-14",
+        "2026-08-15",
+    ]
+    assert FactStore(root).verify(deep=True).hours_verified == 8 * 24
+
+
+def test_driver_honors_a_longer_fact_retention_window(tmp_path: Path) -> None:
+    from tests.release_fixtures import sealed_store
+
+    root = tmp_path / "facts"
+    sealed_store(root, 9)
+
+    summary = PipelineDriver(
+        root,
+        source=NeverSource(),
+        clock=lambda: datetime(2026, 8, 15, 23, 59, tzinfo=UTC),
+        object_store=LocalObjectStore(tmp_path / "objects"),
+        fact_retention_days=9,
+    ).run(heal_days=9)
+
+    assert summary.exit_code == 0
+    assert len(FactStore(root).seals()) == 9
+
+
 def test_source_epoch_prevents_pre_epoch_days_from_being_healed_or_considered(
     tmp_path: Path,
 ) -> None:
@@ -170,6 +228,12 @@ def test_driver_publishes_exactly_two_objects_and_records_the_structured_run_rep
             "published_builds": 1,
             "published": True,
         },
+        "retention": {
+            "source_days_pruned": 0,
+            "hours_pruned": 0,
+            "files_pruned": 0,
+            "bytes_pruned": 0,
+        },
     }
     assert [request.key for request in objects.requests if request.operation == "put"] == [
         HEROES_KEY,
@@ -217,6 +281,29 @@ def test_one_product_failure_preserves_it_but_the_other_product_still_updates(
     assert summary.report["builds"]["published"] is True
     assert objects.get(HEROES_KEY).body == old_heroes
     assert objects.get(BUILDS_KEY) is not None
+
+
+def test_one_product_failure_does_not_prune_old_facts(tmp_path: Path) -> None:
+    from tests.release_fixtures import sealed_store
+
+    root = tmp_path / "facts"
+    sealed_store(root, 9)
+
+    def fail_heroes(product: str, stage: str) -> None:
+        if product == "heroes" and stage == "after_build":
+            raise RuntimeError("fixture heroes failure")
+
+    summary = PipelineDriver(
+        root,
+        source=NeverSource(),
+        clock=lambda: datetime(2026, 8, 15, 23, 59, tzinfo=UTC),
+        object_store=LocalObjectStore(tmp_path / "objects"),
+        publication_fault_injector=fail_heroes,
+    ).run(heal_days=9)
+
+    assert summary.exit_code == 4
+    assert len(FactStore(root).seals()) == 9
+    assert FactStore(root).committed_hours()[0] == "2026-08-07T00"
 
 
 def test_failed_bundle_is_reported_and_its_source_hour_remains_incomplete(
@@ -344,23 +431,28 @@ def test_run_summary_records_low_cardinality_source_performance(tmp_path: Path) 
 
 
 def test_no_publish_writes_valid_local_snapshots_without_object_store_calls(
-    tmp_path: Path, canonical_fact_store
+    tmp_path: Path,
 ) -> None:
-    root, _store = canonical_fact_store
+    from tests.release_fixtures import sealed_store
+
+    root = tmp_path / "facts"
+    sealed_store(root, 9)
     objects = LocalObjectStore(tmp_path / "objects")
 
     summary = PipelineDriver(
         root,
         source=NeverSource(),
-        clock=lambda: datetime(2026, 8, 13, 23, 59, tzinfo=UTC),
+        clock=lambda: datetime(2026, 8, 15, 23, 59, tzinfo=UTC),
         object_store=objects,
-    ).run(heal_days=7, publish=False)
+    ).run(heal_days=9, publish=False)
 
     assert summary.report["heroes"]["published"] is False
     assert summary.report["builds"]["published"] is False
     assert objects.requests == []
     assert (root / "snapshots/heroes/latest.json").is_file()
     assert (root / "snapshots/builds/latest.json").is_file()
+    assert len(FactStore(root).seals()) == 9
+    assert FactStore(root).committed_hours()[0] == "2026-08-07T00"
 
 
 def test_expired_hour_abandons_the_day_and_is_visible_in_status(tmp_path: Path) -> None:
