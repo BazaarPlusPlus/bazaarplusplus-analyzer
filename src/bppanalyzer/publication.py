@@ -432,7 +432,9 @@ class SnapshotBuilder:
         finally:
             connection.close()
 
-        ranked_by_hero: dict[str, list[dict[str, Any]]] = {hero: [] for hero in CANONICAL_HEROES}
+        candidates_by_hero: dict[str, list[dict[str, Any]]] = {
+            hero: [] for hero in CANONICAL_HEROES
+        }
         for hero, build_key, completed, ten_win, known_days, layout_json in candidate_rows:
             days = [int(value) for value in known_days] if known_days is not None else []
             p75 = days[math.ceil(0.75 * len(days)) - 1] if days else None
@@ -444,12 +446,10 @@ class SnapshotBuilder:
                 "score": wilson_score(int(ten_win), int(completed)),
                 "layout": json.loads(str(layout_json)),
             }
-            ranked_by_hero[str(hero)].append(candidate)
-        for candidates in ranked_by_hero.values():
-            candidates.sort(key=_candidate_order)
+            candidates_by_hero[str(hero)].append(candidate)
 
         selected_by_hero: dict[str, list[dict[str, Any]]] = {}
-        for hero, candidates in ranked_by_hero.items():
+        for hero, candidates in candidates_by_hero.items():
             selected_identities = select_build_identities(
                 BuildRank(
                     identity=candidate["identity"],
@@ -719,17 +719,6 @@ def _required_row(value: tuple[Any, ...] | None, label: str) -> tuple[Any, ...]:
     if value is None:
         raise PublicationError(f"{label} query returned no row")
     return value
-
-
-def _candidate_order(candidate: Mapping[str, Any]) -> tuple[object, ...]:
-    p75 = candidate["p75"]
-    return (
-        -int(candidate["score"]),
-        -int(candidate["ten_win"]),
-        p75 is None,
-        int(p75) if p75 is not None else 0,
-        candidate["identity"],
-    )
 
 
 def select_build_identities(candidates: Iterable[BuildRank]) -> tuple[tuple[str, ...], ...]:
